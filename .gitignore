@@ -1,0 +1,5 @@
+data/output/
+Manifest.toml
+*.png
+.DS_Store
+RESULTADOS.md
