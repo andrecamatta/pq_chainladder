@@ -9,8 +9,9 @@ export load_scr_series, ScrSeries
 """
 Série trimestral real de inadimplência agregada (crédito pessoal sem
 consignação, PF) extraída do SCR.data do Banco Central do Brasil
-(jun/2012 em diante). Usada só como índice de estresse macro para modular
-a curva de maturação da safra simulada, não como triângulo de safra em si.
+(set/2012 em diante, primeira data-base trimestral disponível na amostra
+baixada). Usada só como índice de estresse macro para modular a curva de
+maturação da safra simulada, não como triângulo de safra em si.
 """
 struct ScrSeries
     data_base::Vector{Date}

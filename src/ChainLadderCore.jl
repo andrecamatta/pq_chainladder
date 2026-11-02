@@ -4,9 +4,10 @@ using Statistics
 using Distributions
 using Random
 
-export last_observed_col, dev_factors, cdf_to_ultimate, project_chain_ladder,
-       fitted_retro_triangle, pearson_residuals, mack_mseps, bootstrap_odp,
-       bornhuetter_ferguson, calendar_effect_test
+export last_observed_col, dev_factors, extrapolate_factor_tail, extrapolate_sigma2_tail,
+       observed_sigma2, cdf_to_ultimate, project_chain_ladder, fitted_retro_triangle,
+       pearson_residuals, mack_mseps, bootstrap_reserves, bornhuetter_ferguson,
+       calendar_effect_test
 
 function last_observed_col(tri::AbstractMatrix{<:Real}, i::Int)
     k = 0
@@ -22,9 +23,10 @@ end
     dev_factors(tri)
 
 Fatores de desenvolvimento ponderados por volume (chain ladder clássico),
-devolvendo `f` (vetor de fatores f_1..f_{maxdev-1}), `s` (soma usada como
-denominador em cada coluna, necessária para o erro padrão de Mack) e `n`
-(número de safras usadas em cada coluna).
+devolvendo `f` (vetor de fatores f_1..f_{maxdev-1}, `NaN` onde não há par
+observado), `s` (soma usada como denominador em cada coluna, necessária
+para o erro padrão de Mack) e `n` (número de safras usadas em cada
+coluna). Não extrapola cauda: isso é feito por `extrapolate_factor_tail`.
 """
 function dev_factors(tri::AbstractMatrix{<:Real})
     n_cohorts, max_dev = size(tri)
@@ -52,16 +54,86 @@ function dev_factors(tri::AbstractMatrix{<:Real})
 end
 
 """
+    extrapolate_factor_tail(f, n; min_pairs=2)
+
+Extrapolação de cauda por curva ajustada em log(f_k - 1) contra a idade k
+(forma de Sherman, padrão em literatura atuarial de cauda), usando só as
+colunas com pelo menos `min_pairs` safras observadas para o ajuste de
+mínimos quadrados. Colunas sem fator observável recebem o valor
+extrapolado pela curva; colunas observadas não são alteradas. Devolve o
+vetor de fatores completo e os coeficientes `(a, b)` da reta ajustada
+(`f_k = 1 + exp(a + b*k)`), ou `(NaN, NaN)` se não houver pontos
+suficientes para ajustar (caso em que a cauda usa o último fator
+observado, sem decaimento adicional, e isso deve ser declarado).
+"""
+function extrapolate_factor_tail(f::Vector{Float64}, n::Vector{Int}; min_pairs::Int=2)
+    K = length(f)
+    ks = [k for k in 1:K if !isnan(f[k]) && n[k] >= min_pairs && f[k] > 1.0]
+    f_full = copy(f)
+    if length(ks) < 2
+        last_obs = findlast(!isnan, f)
+        fallback = last_obs === nothing ? 1.0 : f[last_obs]
+        for k in 1:K
+            isnan(f_full[k]) && (f_full[k] = fallback)
+        end
+        return f_full, (NaN, NaN)
+    end
+    xs = Float64.(ks)
+    ys = [log(f[k] - 1.0) for k in ks]
+    xbar, ybar = mean(xs), mean(ys)
+    b = sum((xs .- xbar) .* (ys .- ybar)) / sum((xs .- xbar) .^ 2)
+    a = ybar - b * xbar
+    for k in 1:K
+        isnan(f_full[k]) && (f_full[k] = 1.0 + exp(a + b * k))
+    end
+    return f_full, (a, b)
+end
+
+"""
+    extrapolate_sigma2_tail(sigma2, n; min_pairs=2)
+
+Mesma lógica de `extrapolate_factor_tail`, aplicada a σ²_k: ajusta
+log(σ²_k) contra a idade k nas colunas com `n[k] >= min_pairs`, e usa a
+curva para preencher as colunas sem dado suficiente. Consistente com a
+extrapolação de cauda dos próprios fatores, em vez da regra
+min(σ²[k+1], σ²[k+1]²) (que não é a extrapolação de Mack e zera a cauda
+prematuramente).
+"""
+function extrapolate_sigma2_tail(sigma2::Vector{Float64}, n::Vector{Int}; min_pairs::Int=2)
+    K = length(sigma2)
+    ks = [k for k in 1:K if !isnan(sigma2[k]) && n[k] >= min_pairs && sigma2[k] > 0]
+    sigma2_full = copy(sigma2)
+    if length(ks) < 2
+        last_obs = findlast(k -> !isnan(sigma2[k]) && sigma2[k] > 0, 1:K)
+        fallback = last_obs === nothing ? 0.0 : sigma2[last_obs]
+        for k in 1:K
+            isnan(sigma2_full[k]) && (sigma2_full[k] = fallback)
+        end
+        return sigma2_full, (NaN, NaN)
+    end
+    xs = Float64.(ks)
+    ys = [log(sigma2[k]) for k in ks]
+    xbar, ybar = mean(xs), mean(ys)
+    b = sum((xs .- xbar) .* (ys .- ybar)) / sum((xs .- xbar) .^ 2)
+    a = ybar - b * xbar
+    for k in 1:K
+        isnan(sigma2_full[k]) && (sigma2_full[k] = exp(a + b * k))
+    end
+    return sigma2_full, (a, b)
+end
+
+"""
     cdf_to_ultimate(f)
 
 `CDF[j]` é o fator cumulativo que leva a coluna `j` até a última coluna
-(ultimate). `CDF[maxdev] = 1`.
+(ultimate). `CDF[maxdev] = 1`. Espera um vetor de fatores já com a cauda
+extrapolada (sem `NaN`).
 """
 function cdf_to_ultimate(f::Vector{Float64})
     max_dev = length(f) + 1
     cdf = fill(1.0, max_dev)
     for j in (max_dev - 1):-1:1
-        cdf[j] = (isnan(f[j]) ? 1.0 : f[j]) * cdf[j + 1]
+        cdf[j] = f[j] * cdf[j + 1]
     end
     return cdf
 end
@@ -83,10 +155,10 @@ end
     fitted_retro_triangle(tri, f)
 
 Triângulo ajustado retrospectivamente: para cada safra, usa o último
-valor observado e os fatores de desenvolvimento para reconstruir uma
-curva suave em todas as colunas (observadas e futuras). É a base para os
-resíduos de Pearson (bootstrap) e coincide com a projeção chain ladder
-nas colunas futuras.
+valor observado e os fatores de desenvolvimento (já com cauda
+extrapolada) para reconstruir uma curva suave em todas as colunas. É a
+base para os resíduos de Pearson (bootstrap) e coincide com a projeção
+chain ladder nas colunas futuras.
 """
 function fitted_retro_triangle(tri::AbstractMatrix{<:Real}, f::Vector{Float64})
     n_cohorts, max_dev = size(tri)
@@ -117,9 +189,9 @@ end
     pearson_residuals(tri, f)
 
 Resíduos de Pearson do chain ladder visto como GLM Poisson sobredisperso
-(England; Verrall, 1999/2002), calculados só nas células observadas.
-Devolve a matriz de resíduos, o incremento ajustado e o parâmetro de
-dispersão de Pearson (phi).
+(Renshaw; Verrall, 1998), calculados só nas células observadas. Devolve a
+matriz de resíduos, o incremento ajustado e o parâmetro de dispersão de
+Pearson (phi). `f` já deve vir com a cauda extrapolada.
 """
 function pearson_residuals(tri::AbstractMatrix{<:Real}, f::Vector{Float64})
     n_cohorts, max_dev = size(tri)
@@ -145,15 +217,15 @@ function pearson_residuals(tri::AbstractMatrix{<:Real}, f::Vector{Float64})
 end
 
 """
-    mack_mseps(tri, f)
+    observed_sigma2(tri, f, n)
 
-Erro quadrático médio de previsão (MSEP) de Mack (1993), decomposto em
-variância de processo e de estimação, por safra e para a reserva total.
-Devolve `(mseps_por_safra, msep_total, sigma2)`.
+σ²_k observado de Mack (1993) por coluna: a variância dos incrementos
+relativos ponderada pelo valor acumulado, só onde há pelo menos 2 safras
+no par (k, k+1). Colunas sem dado suficiente ficam `NaN`, para
+extrapolação posterior por `extrapolate_sigma2_tail`.
 """
-function mack_mseps(tri::AbstractMatrix{<:Real}, f::Vector{Float64})
+function observed_sigma2(tri::AbstractMatrix{<:Real}, f::Vector{Float64}, n::Vector{Int})
     n_cohorts, max_dev = size(tri)
-    _, s, n = dev_factors(tri)
     sigma2 = fill(NaN, max_dev - 1)
     for k in 1:(max_dev - 1)
         n[k] < 2 && continue
@@ -165,64 +237,90 @@ function mack_mseps(tri::AbstractMatrix{<:Real}, f::Vector{Float64})
         end
         sigma2[k] = acc / (n[k] - 1)
     end
-    # extrapolação simples de Mack para a última coluna sem graus de liberdade
-    for k in (max_dev - 1):-1:1
-        if isnan(sigma2[k])
-            if k < max_dev - 1 && !isnan(sigma2[k + 1])
-                sigma2[k] = min(sigma2[k + 1], sigma2[k + 1]^2)
-            elseif k > 1 && !isnan(sigma2[k - 1])
-                sigma2[k] = sigma2[k - 1]
-            else
-                sigma2[k] = 0.0
-            end
-        end
+    return sigma2
+end
+
+"""
+    mack_mseps(tri, f, sigma2; target_col=nothing)
+
+Erro quadrático médio de previsão (MSEP) de Mack (1993), somado só até
+`target_col[i]` (por padrão, a última coluna do triângulo, ou seja, o
+ultimate completo). `f` e `sigma2` já devem vir com a cauda extrapolada
+(`extrapolate_factor_tail`, `extrapolate_sigma2_tail`), para que a
+incerteza da cauda entre na soma em vez de ser tratada como zero.
+Devolve `(mseps_por_safra, msep_total)`.
+"""
+function mack_mseps(tri::AbstractMatrix{<:Real}, f::Vector{Float64}, sigma2::Vector{Float64};
+                     target_col::Union{Nothing, Vector{Int}}=nothing)
+    n_cohorts, max_dev = size(tri)
+    _, s, n = dev_factors(tri)
+    # para colunas sem par observado, a soma s[k] (exposição) é aproximada pela
+    # última exposição observada, já que a extrapolação de cauda assume o mesmo
+    # tipo de comportamento agregado das colunas vizinhas
+    s_full = copy(s)
+    last_s = findlast(!isnan, s)
+    for k in eachindex(s_full)
+        isnan(s_full[k]) && (s_full[k] = last_s === nothing ? 0.0 : s[last_s])
     end
 
     proj = project_chain_ladder(tri, f)
     k_vec = [last_observed_col(tri, i) for i in 1:n_cohorts]
-    ultimate = proj[:, max_dev]
+    tcol = target_col === nothing ? fill(max_dev, n_cohorts) : target_col
 
     msep_i = fill(0.0, n_cohorts)
     for i in 1:n_cohorts
         k_i = k_vec[i]
-        (k_i == 0 || k_i >= max_dev) && continue
+        tc = tcol[i]
+        (k_i == 0 || k_i >= tc) && continue
         acc = 0.0
-        for k in k_i:(max_dev - 1)
+        for k in k_i:(tc - 1)
             fk = f[k]
-            (isnan(fk) || fk == 0 || isnan(sigma2[k]) || isnan(s[k]) || s[k] <= 0) && continue
-            acc += (sigma2[k] / fk^2) * (1 / proj[i, k] + 1 / s[k])
+            (fk == 0 || s_full[k] <= 0) && continue
+            acc += (sigma2[k] / fk^2) * (1 / proj[i, k] + 1 / s_full[k])
         end
-        msep_i[i] = ultimate[i]^2 * acc
+        msep_i[i] = proj[i, tc]^2 * acc
     end
 
     msep_total = sum(msep_i)
     for i in 1:n_cohorts, ip in 1:n_cohorts
         i >= ip && continue
         k_i, k_ip = k_vec[i], k_vec[ip]
-        (k_i == 0 || k_ip == 0 || k_i >= max_dev || k_ip >= max_dev) && continue
+        tc_i, tc_ip = tcol[i], tcol[ip]
+        (k_i == 0 || k_ip == 0 || k_i >= tc_i || k_ip >= tc_ip) && continue
         kmin = max(k_i, k_ip)
+        tcmin = min(tc_i, tc_ip)
+        kmin >= tcmin && continue
         acc = 0.0
-        for k in kmin:(max_dev - 1)
+        for k in kmin:(tcmin - 1)
             fk = f[k]
-            (isnan(fk) || fk == 0 || isnan(sigma2[k]) || isnan(s[k]) || s[k] <= 0) && continue
-            acc += sigma2[k] / fk^2 / s[k]
+            (fk == 0 || s_full[k] <= 0) && continue
+            acc += sigma2[k] / fk^2 / s_full[k]
         end
-        msep_total += 2 * ultimate[i] * ultimate[ip] * acc
+        msep_total += 2 * proj[i, tc_i] * proj[ip, tc_ip] * acc
     end
 
-    return msep_i, msep_total, sigma2
+    return msep_i, msep_total
 end
 
 """
-    bootstrap_odp(tri, f; n_boot=1000, seed=20261102)
+    bootstrap_reserves(tri, f; n_boot=1000, seed=20261102, target_col=nothing,
+                        prior_rate=nothing, volume=nothing)
 
-Bootstrap ODP (England; Verrall, 1999/2002): reamostra resíduos de
-Pearson para gerar incerteza de parâmetro, e soma incerteza de processo
-via distribuição Gama com a dispersão de Pearson estimada. Devolve o
-vetor de reservas totais simuladas (distribuição preditiva completa).
+Bootstrap ODP (Renshaw; Verrall, 1998; England; Verrall, 1999/2002):
+reamostra resíduos de Pearson para gerar incerteza de parâmetro, e soma
+incerteza de processo via distribuição Gama com a dispersão de Pearson
+estimada. Projeta até `target_col[i]` (ultimate por padrão). Se
+`prior_rate` e `volume` forem passados, cada réplica bootstrap também
+gera uma reserva Bornhuetter-Ferguson usando os mesmos fatores
+reamostrados, o que dá a esse método um intervalo de incerteza próprio
+(ausente na formulação determinística usual de BF), reaproveitando o
+mesmo laço de reamostragem. Devolve `(reservas_cl, reservas_bf_ou_nothing, phi)`.
 """
-function bootstrap_odp(tri::AbstractMatrix{<:Real}, f::Vector{Float64};
-                        n_boot::Int=1000, seed::Int=20261102)
+function bootstrap_reserves(tri::AbstractMatrix{<:Real}, f::Vector{Float64};
+                             n_boot::Int=1000, seed::Int=20261102,
+                             target_col::Union{Nothing, Vector{Int}}=nothing,
+                             prior_rate::Union{Nothing, Vector{Float64}}=nothing,
+                             volume::Union{Nothing, Vector{Float64}}=nothing)
     n_cohorts, max_dev = size(tri)
     resid, fitted_incr, phi, n_obs, dof = pearson_residuals(tri, f)
     adj = sqrt(n_obs / dof)
@@ -232,13 +330,16 @@ function bootstrap_odp(tri::AbstractMatrix{<:Real}, f::Vector{Float64};
 
     k_vec = [last_observed_col(tri, i) for i in 1:n_cohorts]
     latest = [k_vec[i] == 0 ? 0.0 : tri[i, k_vec[i]] for i in 1:n_cohorts]
+    tcol = target_col === nothing ? fill(max_dev, n_cohorts) : target_col
+    com_bf = prior_rate !== nothing && volume !== nothing
 
     rng = MersenneTwister(seed)
-    reservas = fill(0.0, n_boot)
+    reservas_cl = fill(0.0, n_boot)
+    reservas_bf = com_bf ? fill(0.0, n_boot) : nothing
 
     for b in 1:n_boot
         pseudo_incr = fill(NaN, n_cohorts, max_dev)
-        for (idx, (i, j)) in enumerate(valid_idx)
+        for (i, j) in valid_idx
             e_star = valid_resid[rand(rng, 1:length(valid_resid))]
             fm = max(fitted_incr[i, j], 1e-6)
             pseudo_incr[i, j] = max(fm + e_star * adj * sqrt(fm), 0.0)
@@ -251,48 +352,61 @@ function bootstrap_odp(tri::AbstractMatrix{<:Real}, f::Vector{Float64};
                 pseudo_cum[i, j] = acc
             end
         end
-        f_star, = dev_factors(pseudo_cum)
-        for k in 1:(max_dev - 1)
-            isnan(f_star[k]) && (f_star[k] = f[k])
-        end
+        f_star_raw, s_star, n_star = dev_factors(pseudo_cum)
+        f_star, = extrapolate_factor_tail(f_star_raw, n_star)
+        cdf_star = cdf_to_ultimate(f_star)
 
-        total_reserva = 0.0
+        total_cl = 0.0
+        total_bf = 0.0
         for i in 1:n_cohorts
             k_i = k_vec[i]
-            (k_i == 0 || k_i >= max_dev) && continue
-            cdf_star = cdf_to_ultimate(f_star)
-            mean_ultimate = latest[i] * cdf_star[k_i]
-            mu_reserva = max(mean_ultimate - latest[i], 1e-6)
-            # processo ODP: Var = phi * média, casado por momentos a uma Gama(shape=mu/phi, scale=phi)
-            shape_gamma = mu_reserva / phi
-            scale_gamma = phi
-            ultimate_proc = latest[i] + rand(rng, Gamma(shape_gamma, scale_gamma))
-            total_reserva += ultimate_proc - latest[i]
+            tc = tcol[i]
+            (k_i == 0 || k_i >= tc) && continue
+            mean_cl = latest[i] * cdf_star[k_i] / cdf_star[tc]
+            mu_cl = max(mean_cl - latest[i], 1e-6)
+            shape_cl = mu_cl / phi
+            ultimate_proc_cl = latest[i] + rand(rng, Gamma(shape_cl, phi))
+            total_cl += ultimate_proc_cl - latest[i]
+
+            if com_bf
+                # fração esperada de emergência entre k_i e tc, no mesmo CDF reamostrado
+                frac = (1 / cdf_star[tc] - 1 / cdf_star[k_i])
+                mean_bf = latest[i] + prior_rate[i] * volume[i] * frac
+                mu_bf = max(mean_bf - latest[i], 1e-6)
+                shape_bf = mu_bf / phi
+                ultimate_proc_bf = latest[i] + rand(rng, Gamma(shape_bf, phi))
+                total_bf += ultimate_proc_bf - latest[i]
+            end
         end
-        reservas[b] = total_reserva
+        reservas_cl[b] = total_cl
+        com_bf && (reservas_bf[b] = total_bf)
     end
 
-    return reservas, phi
+    return reservas_cl, reservas_bf, phi
 end
 
 """
-    bornhuetter_ferguson(tri, f, prior_rate, volume)
+    bornhuetter_ferguson(tri, f, prior_rate, volume; target_col=nothing)
 
 Reserva de Bornhuetter-Ferguson (Bornhuetter; Ferguson, 1972): mistura o
 desenvolvimento observado com um `prior_rate` externo (taxa de perda
 esperada a priori, independente da própria safra), ponderado pela fração
-já madura da safra (1/CDF). Devolve a reserva por safra.
+da perda esperada entre a idade atual e `target_col[i]` (ultimate por
+padrão). Devolve a reserva por safra.
 """
 function bornhuetter_ferguson(tri::AbstractMatrix{<:Real}, f::Vector{Float64},
-                               prior_rate::Vector{Float64}, volume::Vector{Float64})
+                               prior_rate::Vector{Float64}, volume::Vector{Float64};
+                               target_col::Union{Nothing, Vector{Int}}=nothing)
     n_cohorts, max_dev = size(tri)
     cdf = cdf_to_ultimate(f)
+    tcol = target_col === nothing ? fill(max_dev, n_cohorts) : target_col
     reserva = fill(0.0, n_cohorts)
     for i in 1:n_cohorts
         k_i = last_observed_col(tri, i)
-        (k_i == 0 || k_i >= max_dev) && continue
-        w = 1 / cdf[k_i]
-        reserva[i] = prior_rate[i] * volume[i] * (1 - w)
+        tc = tcol[i]
+        (k_i == 0 || k_i >= tc) && continue
+        frac = 1 / cdf[tc] - 1 / cdf[k_i]
+        reserva[i] = prior_rate[i] * volume[i] * frac
     end
     return reserva
 end
