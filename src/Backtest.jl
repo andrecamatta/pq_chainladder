@@ -106,6 +106,12 @@ function run_backtest_cut(sim::SimTriangle, valuation_idx::Int, scr_taxa::Vector
     deficit_max = isempty(deficits) ? 0 : maximum(deficits)
     n_safras_truncadas_horizonte = count(>(0), deficits)
 
+    # idade (em trimestres) de comparação usada para as safras ativas: a mais
+    # jovem define o pior caso de maturação medida naquele corte
+    idades_ativas = [tcol[i] for i in 1:sim.n_cohorts if ativo(i)]
+    idade_alvo_minima = isempty(idades_ativas) ? sim.max_dev : minimum(idades_ativas)
+    idade_alvo_maxima = isempty(idades_ativas) ? sim.max_dev : maximum(idades_ativas)
+
     f_stat, p_valor, df_b, df_w = calendar_effect_test(tri, f)
 
     erro_cl_pct = 100 * (reserva_cl - reserva_real) / reserva_real
@@ -120,6 +126,8 @@ function run_backtest_cut(sim::SimTriangle, valuation_idx::Int, scr_taxa::Vector
         n_colunas_extrapoladas = n_colunas_extrapoladas,
         deficit_maturidade_max = deficit_max,
         n_safras_truncadas_horizonte = n_safras_truncadas_horizonte,
+        idade_alvo_minima = idade_alvo_minima,
+        idade_alvo_maxima = idade_alvo_maxima,
         reserva_real = reserva_real,
         reserva_cl = reserva_cl,
         reserva_mack_se = se_mack,

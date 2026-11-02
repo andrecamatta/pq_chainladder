@@ -1,6 +1,3 @@
-import Pkg
-Pkg.activate(joinpath(@__DIR__, ".."))
-
 using Test
 using Statistics
 
@@ -90,18 +87,27 @@ using .ChainLadderCredito.ChainLadderCore
             tri[i, j] = Float64(v)
         end
         f_raw, s, n = dev_factors(tri)
-        # σ² publicado por Mack (1993, Tabela 1), em vez da extrapolação deste
-        # pacote: isola o teste da aritmética do MSEP, sem depender de como a
-        # cauda de σ² é extrapolada (que Mack resolveu com uma regra própria
-        # só para a última coluna, não generalizável ao caso de várias colunas
-        # faltantes que este pacote precisa tratar no backtest real).
-        sigma2_publicado = [160.0, 37.7, 42.0, 15.2, 13.7, 8.19, 0.447, 1.15, 0.477] .* 1000
+        # σ²_1..σ²_8 publicados por Mack (1993, Tabela 1). σ²_9 (última coluna,
+        # só uma safra no par) não é um dado observado, é o próprio resultado
+        # da regra de Mack para a última coluna aplicada a σ²_7 e σ²_8: 0,447
+        # (ver teste seguinte), não 0,477 como uma leitura rápida da tabela
+        # digitalizada pode sugerir.
+        sigma2_publicado = [160.0, 37.7, 42.0, 15.2, 13.7, 8.19, 0.447, 1.15, 0.447] .* 1000
 
         msep_i, msep_total = mack_mseps(tri, f_raw, sigma2_publicado)
         se_total = sqrt(msep_total)
         # Mack (1993, Tabela 3) reporta erro padrão total = 13% da reserva total (18681 mil);
         # replicações usuais do exemplo (pacote R ChainLadder) chegam a ~2447 mil.
         @test 2200_000 <= se_total <= 2700_000
+    end
+
+    @testset "Regra de Mack (1993) para a última coluna de σ² (Taylor/Ashe)" begin
+        # σ²_7 = 0,447 e σ²_8 = 1,15 (Mack, 1993, Tabela 1, em milhares).
+        # Regra de Mack para a coluna final sem grau de liberdade:
+        # σ²_9 = min(σ²_8, σ²_7, σ²_8²/σ²_7) = min(1,15; 0,447; 2,959) = 0,447.
+        sigma2_parcial = [160.0, 37.7, 42.0, 15.2, 13.7, 8.19, 0.447, 1.15]
+        sigma2_9 = mack_classical_last_sigma2(sigma2_parcial)
+        @test sigma2_9 ≈ 0.447 atol=1e-6
     end
 
     @testset "Extrapolação de cauda recupera padrão log-linear sem ruído" begin

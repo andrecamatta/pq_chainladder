@@ -5,9 +5,9 @@ using Distributions
 using Random
 
 export last_observed_col, dev_factors, extrapolate_factor_tail, extrapolate_sigma2_tail,
-       observed_sigma2, cdf_to_ultimate, project_chain_ladder, fitted_retro_triangle,
-       pearson_residuals, mack_mseps, bootstrap_reserves, bornhuetter_ferguson,
-       calendar_effect_test
+       mack_classical_last_sigma2, observed_sigma2, cdf_to_ultimate, project_chain_ladder,
+       fitted_retro_triangle, pearson_residuals, mack_mseps, bootstrap_reserves,
+       bornhuetter_ferguson, calendar_effect_test
 
 function last_observed_col(tri::AbstractMatrix{<:Real}, i::Int)
     k = 0
@@ -120,6 +120,28 @@ function extrapolate_sigma2_tail(sigma2::Vector{Float64}, n::Vector{Int}; min_pa
         isnan(sigma2_full[k]) && (sigma2_full[k] = exp(a + b * k))
     end
     return sigma2_full, (a, b)
+end
+
+"""
+    mack_classical_last_sigma2(sigma2)
+
+Regra original de Mack (1993) para a única coluna final sem grau de
+liberdade suficiente (só uma safra no par), usada no próprio exemplo de
+Taylor/Ashe do artigo. Recebe σ²_1, ..., σ²_K (as colunas já conhecidas) e
+devolve σ²_{K+1} = min(σ²_K, σ²_{K-1}, σ²_K²/σ²_{K-1}). Só resolve esse
+caso específico (uma coluna faltante, a última), não o caso deste
+pipeline, em que várias colunas seguidas podem não ter nenhum par
+observável numa avaliação antecipada. `extrapolate_sigma2_tail`, usada no
+restante deste módulo, é uma generalização por curva log-linear para esse
+caso, declarada como alternativa à regra de Mack, não uma implementação
+dela.
+"""
+function mack_classical_last_sigma2(sigma2::Vector{Float64})
+    K = length(sigma2)
+    @assert K >= 2 "A regra de Mack para a coluna seguinte precisa de pelo menos duas colunas conhecidas"
+    s_last = sigma2[K]
+    s_prev = sigma2[K - 1]
+    return min(s_prev, s_last, s_last^2 / s_prev)
 end
 
 """

@@ -25,10 +25,6 @@ println("Trimestres carregados: ", length(scr.data_base), " (", scr.data_base[1]
 println("Taxa média no período: ", round(100 * mean(scr.taxa), digits=2), "%")
 println("Taxa mínima/máxima: ", round(100 * minimum(scr.taxa), digits=2), "% / ", round(100 * maximum(scr.taxa), digits=2), "%")
 
-CSV.write(joinpath(OUT, "scr_serie_real.csv"),
-          DataFrame(data_base=scr.data_base, carteira_ativa=scr.carteira_ativa,
-                    carteira_inadimplencia=scr.carteira_inadimplencia, taxa=scr.taxa))
-
 println()
 println("== 2. Simulando triângulo de safras (proxy, originação contínua até 2024-Q4) ==")
 MAX_DEV = 24
@@ -52,7 +48,7 @@ println("Safras cuja maturidade completa não cabe no horizonte real: ", n_safra
         " (déficit máximo: ", sim.max_dev - minimum(sim.max_age_within_horizon), " trimestres, na safra mais recente)")
 println("Volume originado total (todas as safras): R\$ ", round(sum(sim.volume) / 1e9, digits=1), " bilhões")
 println("ATENÇÃO: dilution_factor, shape_a, shape_b, cv_incremento e origination_share são hipóteses")
-println("assumidas para a simulação, não parâmetros calibrados em dado de safra real (que não existe).")
+println("assumidas para a simulação, modulada pela série real de inadimplência, não calibradas nela.")
 
 df_tri = DataFrame()
 for i in 1:sim.n_cohorts
@@ -85,6 +81,8 @@ function monta_df(resultados)
         n_colunas_extrapoladas = [r.n_colunas_extrapoladas for r in resultados],
         deficit_maturidade_max = [r.deficit_maturidade_max for r in resultados],
         n_safras_truncadas_horizonte = [r.n_safras_truncadas_horizonte for r in resultados],
+        idade_alvo_minima = [r.idade_alvo_minima for r in resultados],
+        idade_alvo_maxima = [r.idade_alvo_maxima for r in resultados],
         reserva_real_bi = [r.reserva_real / 1e9 for r in resultados],
         reserva_cl_bi = [r.reserva_cl / 1e9 for r in resultados],
         reserva_bf_bi = [r.reserva_bf / 1e9 for r in resultados],
@@ -112,57 +110,98 @@ println(df_bt)
 function resumo_metricas(df_bt; rotulo="")
     mae_cl = mean(abs.(df_bt.erro_cl_pct))
     mae_bf = mean(abs.(df_bt.erro_bf_pct))
+    med_cl = median(abs.(df_bt.erro_cl_pct))
+    med_bf = median(abs.(df_bt.erro_bf_pct))
     w = df_bt.reserva_real_bi
     mae_cl_pond = sum(w .* abs.(df_bt.erro_cl_pct)) / sum(w)
     mae_bf_pond = sum(w .* abs.(df_bt.erro_bf_pct)) / sum(w)
     println()
     println("-- Resumo$(isempty(rotulo) ? "" : " ($rotulo)") --")
-    println("Erro absoluto médio simples -- CL: ", round(mae_cl, digits=1), "% | BF: ", round(mae_bf, digits=1), "%")
-    println("Erro absoluto médio ponderado pela reserva -- CL: ", round(mae_cl_pond, digits=1), "% | BF: ", round(mae_bf_pond, digits=1), "%")
+    println("Erro absoluto médio simples -- CL: ", round(mae_cl, digits=2), "% | BF: ", round(mae_bf, digits=2), "%")
+    println("Mediana do erro absoluto -- CL: ", round(med_cl, digits=2), "% | BF: ", round(med_bf, digits=2), "%")
+    println("Erro absoluto médio ponderado pela reserva -- CL: ", round(mae_cl_pond, digits=2), "% | BF: ", round(mae_bf_pond, digits=2), "%")
     println("Subestimação -- CL: ", sum(df_bt.sub_cl), "/", nrow(df_bt), " | BF: ", sum(df_bt.sub_bf), "/", nrow(df_bt))
-    println("Cortes em que CL tem menor |erro| que BF: ", sum(abs.(df_bt.erro_cl_pct) .< abs.(df_bt.erro_bf_pct)), "/", nrow(df_bt))
+    println("Cortes em que CL tem menor |erro| que BF: ", sum(abs.(df_bt.erro_cl_pct) .< abs.(df_bt.erro_bf_pct)), "/", nrow(df_bt),
+            " (", join(Dates.format.(df_bt.data_avaliacao[abs.(df_bt.erro_cl_pct) .< abs.(df_bt.erro_bf_pct)], "yyyy"), ", "), ")")
     println("Cobertura IC95% -- Mack (CL): ", sum(df_bt.cobertura_mack_95), "/", nrow(df_bt),
             " | bootstrap CL: ", sum(df_bt.cobertura_boot_cl_95), "/", nrow(df_bt),
             " | bootstrap BF: ", sum(df_bt.cobertura_boot_bf_95), "/", nrow(df_bt))
     println("Cortes com efeito de calendário significativo (p<0,05): ", sum(df_bt.cal_p_valor .< 0.05), "/", nrow(df_bt))
-    return (mae_cl=mae_cl, mae_bf=mae_bf, mae_cl_pond=mae_cl_pond, mae_bf_pond=mae_bf_pond)
+    return (mae_cl=mae_cl, mae_bf=mae_bf, med_cl=med_cl, med_bf=med_bf, mae_cl_pond=mae_cl_pond, mae_bf_pond=mae_bf_pond)
 end
 
 resumo_bem_especificado = resumo_metricas(df_bt; rotulo="prior bem especificado")
 
-proporcao_jovens = df_bt.n_safras_jovens ./ df_bt.n_safras_ativas
-mediana_prop = median(proporcao_jovens)
-cortes_muitas_jovens = df_bt[proporcao_jovens .>= mediana_prop, :]
-cortes_poucas_jovens = df_bt[proporcao_jovens .< mediana_prop, :]
 println()
-println("-- Separando cortes pela proporção de safras jovens sobre ativas (mediana = ",
-        round(100 * mediana_prop, digits=1), "%) --")
-if nrow(cortes_muitas_jovens) > 0
-    println("Cortes com mais safras jovens (n=", nrow(cortes_muitas_jovens), "): MAE CL ",
-            round(mean(abs.(cortes_muitas_jovens.erro_cl_pct)), digits=1), "%, MAE BF ",
-            round(mean(abs.(cortes_muitas_jovens.erro_bf_pct)), digits=1), "%")
-end
-if nrow(cortes_poucas_jovens) > 0
-    println("Cortes com menos safras jovens (n=", nrow(cortes_poucas_jovens), "): MAE CL ",
-            round(mean(abs.(cortes_poucas_jovens.erro_cl_pct)), digits=1), "%, MAE BF ",
-            round(mean(abs.(cortes_poucas_jovens.erro_bf_pct)), digits=1), "%")
-end
+println("== 3b. Robustez: a vantagem média do BF depende de um corte só? ==")
+idx_2021 = findfirst(==(Date(2021, 12, 31)), df_bt.data_avaliacao)
+sem_2021 = df_bt[setdiff(1:nrow(df_bt), [idx_2021]), :]
+mae_cl_sem21 = mean(abs.(sem_2021.erro_cl_pct))
+mae_bf_sem21 = mean(abs.(sem_2021.erro_bf_pct))
+println("Erro de dez/2021 isolado -- CL: ", round(df_bt.erro_cl_pct[idx_2021], digits=1), "% | BF: ", round(df_bt.erro_bf_pct[idx_2021], digits=1), "%")
+println("MAE simples excluindo dez/2021 -- CL: ", round(mae_cl_sem21, digits=2), "% | BF: ", round(mae_bf_sem21, digits=2), "%")
+
+maduros = df_bt[df_bt.deficit_maturidade_max .== 0, :]
+truncados = df_bt[df_bt.deficit_maturidade_max .> 0, :]
+mae_cl_maduro = mean(abs.(maduros.erro_cl_pct))
+mae_bf_maduro = mean(abs.(maduros.erro_bf_pct))
+w_mad = maduros.reserva_real_bi
+mae_cl_maduro_pond = sum(w_mad .* abs.(maduros.erro_cl_pct)) / sum(w_mad)
+mae_bf_maduro_pond = sum(w_mad .* abs.(maduros.erro_bf_pct)) / sum(w_mad)
+mae_cl_truncado = mean(abs.(truncados.erro_cl_pct))
+mae_bf_truncado = mean(abs.(truncados.erro_bf_pct))
+println("Cortes medidos até a maturidade completa (", nrow(maduros), " cortes, ",
+        join(Dates.format.(maduros.data_avaliacao, "yyyy"), "-"), "): MAE CL ",
+        round(mae_cl_maduro, digits=1), "% | BF ", round(mae_bf_maduro, digits=1),
+        "% (ponderado: CL ", round(mae_cl_maduro_pond, digits=1), "% | BF ", round(mae_bf_maduro_pond, digits=1), "%)")
+println("Cortes com horizonte truncado (", nrow(truncados), " cortes, ",
+        join(Dates.format.(truncados.data_avaliacao, "yyyy"), "-"), "): MAE CL ",
+        round(mae_cl_truncado, digits=1), "% | BF ", round(mae_bf_truncado, digits=1), "%")
 
 println()
-println("== 4. Backtest com prior do BF mal especificado (viés de +25% no nível) ==")
-resultados_mal = run_rolling_backtest(sim, valuation_pontos, scr.taxa, 2.2; n_boot=1000, prior_vies=1.25)
-df_bt_mal = monta_df(resultados_mal)
-CSV.write(joinpath(OUT, "backtest_resultados_prior_mal_especificado.csv"), df_bt_mal)
-resumo_mal_especificado = resumo_metricas(df_bt_mal; rotulo="prior mal especificado, +25%")
+println("-- Separando cortes pela proporção de safras jovens sobre ativas (achado nulo, reportado) --")
+proporcao_jovens = df_bt.n_safras_jovens ./ df_bt.n_safras_ativas
+mediana_prop = median(proporcao_jovens)
+println("Proporção de safras jovens varia de ", round(100 * minimum(proporcao_jovens), digits=1), "% a ",
+        round(100 * maximum(proporcao_jovens), digits=1), "%, mediana ", round(100 * mediana_prop, digits=1),
+        "%, sem variação suficiente para separar cortes de forma informativa nesta simulação.")
+
+println()
+println("== 4. Sensibilidade do prior do BF (viés de +25% e -25% no nível) ==")
+resultados_mais = run_rolling_backtest(sim, valuation_pontos, scr.taxa, 2.2; n_boot=1000, prior_vies=1.25)
+df_bt_mais = monta_df(resultados_mais)
+CSV.write(joinpath(OUT, "backtest_resultados_prior_mais25.csv"), df_bt_mais)
+resumo_mais25 = resumo_metricas(df_bt_mais; rotulo="prior mal especificado, +25%")
+
+resultados_menos = run_rolling_backtest(sim, valuation_pontos, scr.taxa, 2.2; n_boot=1000, prior_vies=0.75)
+df_bt_menos = monta_df(resultados_menos)
+CSV.write(joinpath(OUT, "backtest_resultados_prior_menos25.csv"), df_bt_menos)
+resumo_menos25 = resumo_metricas(df_bt_menos; rotulo="prior mal especificado, -25%")
 
 resumo = Dict(
     "n_cortes" => nrow(df_bt),
     "mae_cl_pct" => resumo_bem_especificado.mae_cl,
     "mae_bf_pct" => resumo_bem_especificado.mae_bf,
+    "mediana_cl_pct" => resumo_bem_especificado.med_cl,
+    "mediana_bf_pct" => resumo_bem_especificado.med_bf,
     "mae_cl_pct_ponderado" => resumo_bem_especificado.mae_cl_pond,
     "mae_bf_pct_ponderado" => resumo_bem_especificado.mae_bf_pond,
-    "mae_bf_pct_prior_mal" => resumo_mal_especificado.mae_bf,
-    "mae_bf_pct_ponderado_prior_mal" => resumo_mal_especificado.mae_bf_pond,
+    "mae_cl_pct_sem_2021" => mae_cl_sem21,
+    "mae_bf_pct_sem_2021" => mae_bf_sem21,
+    "erro_cl_pct_2021" => df_bt.erro_cl_pct[idx_2021],
+    "erro_bf_pct_2021" => df_bt.erro_bf_pct[idx_2021],
+    "mae_cl_pct_maduro" => mae_cl_maduro,
+    "mae_bf_pct_maduro" => mae_bf_maduro,
+    "mae_cl_pct_maduro_ponderado" => mae_cl_maduro_pond,
+    "mae_bf_pct_maduro_ponderado" => mae_bf_maduro_pond,
+    "mae_cl_pct_truncado" => mae_cl_truncado,
+    "mae_bf_pct_truncado" => mae_bf_truncado,
+    "n_cortes_maduros" => nrow(maduros),
+    "n_cortes_truncados" => nrow(truncados),
+    "mae_bf_pct_prior_mais25" => resumo_mais25.mae_bf,
+    "mae_bf_pct_ponderado_prior_mais25" => resumo_mais25.mae_bf_pond,
+    "mae_bf_pct_prior_menos25" => resumo_menos25.mae_bf,
+    "mae_bf_pct_ponderado_prior_menos25" => resumo_menos25.mae_bf_pond,
     "sub_cl" => sum(df_bt.sub_cl),
     "sub_bf" => sum(df_bt.sub_bf),
     "cortes_cl_vence" => sum(abs.(df_bt.erro_cl_pct) .< abs.(df_bt.erro_bf_pct)),
@@ -179,6 +218,7 @@ resumo = Dict(
     "safra_fim" => string(origem_datas[end]),
     "n_safras_truncadas_horizonte_total" => n_safras_truncadas,
     "deficit_maturidade_maximo" => sim.max_dev - minimum(sim.max_age_within_horizon),
+    "idade_alvo_minima_2024" => df_bt.idade_alvo_minima[end],
 )
 open(joinpath(OUT, "resumo.json"), "w") do io
     JSON3.write(io, resumo)
