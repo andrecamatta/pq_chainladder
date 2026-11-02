@@ -88,17 +88,15 @@ using .ChainLadderCredito.ChainLadderCore
         end
         f_raw, s, n = dev_factors(tri)
         # σ²_1..σ²_8 publicados por Mack (1993, Tabela 1). σ²_9 (última coluna,
-        # só uma safra no par) não é um dado observado, é o próprio resultado
-        # da regra de Mack para a última coluna aplicada a σ²_7 e σ²_8: 0,447
-        # (ver teste seguinte), não 0,477 como uma leitura rápida da tabela
-        # digitalizada pode sugerir.
+        # só uma safra no par) é o próprio resultado da regra de Mack para a
+        # última coluna aplicada a σ²_7 e σ²_8: 0,447 (ver teste seguinte).
         sigma2_publicado = [160.0, 37.7, 42.0, 15.2, 13.7, 8.19, 0.447, 1.15, 0.447] .* 1000
 
         msep_i, msep_total = mack_mseps(tri, f_raw, sigma2_publicado)
         se_total = sqrt(msep_total)
         # Mack (1993, Tabela 3) reporta erro padrão total = 13% da reserva total (18681 mil);
-        # replicações usuais do exemplo (pacote R ChainLadder) chegam a ~2447 mil.
-        @test 2200_000 <= se_total <= 2700_000
+        # replicações usuais do exemplo (pacote R ChainLadder) chegam a ≈2.447.095.
+        @test se_total ≈ 2_447_095 rtol=1e-3
     end
 
     @testset "Regra de Mack (1993) para a última coluna de σ² (Taylor/Ashe)" begin
