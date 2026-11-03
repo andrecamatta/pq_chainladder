@@ -77,6 +77,29 @@ trecho não representativo e super-estima a velocidade de queda de
 `f_k - 1`, subestimando a cauda e a reserva. Com poucas colunas
 disponíveis (`<= max_pontos_ajuste`), o comportamento é idêntico a usar
 todo o histórico.
+
+A reta ajustada é forçada a ser não-crescente (`b <= 0`): um fator de
+desenvolvimento que cresce com a idade, em vez de decair a 1, contradiz a
+própria forma de Sherman que motiva esse ajuste (ver módulo). Na prática
+esse caso não ocorre no ajuste determinístico (conferido para os 9 cortes
+do backtest e em 200 sementes com `m_t ≡ 1`), mas é um guarda de
+segurança barato: se ocorrer (por exemplo, com um triângulo ainda mais
+raso do que os testados aqui), cai-se no mesmo fallback usado com menos
+de dois pontos (cauda plana no último fator observado) em vez de
+extrapolar um crescimento sem fundamento.
+
+Isso **não** é o que evita a explosão do bootstrap em cortes com
+triângulo raso (ver `bootstrap_reserves`): lá, o problema não é o sinal
+da inclinação, e sim reajustar a própria curva de cauda a cada réplica
+reamostrada. Com poucos pontos de ajuste (chegando a 2 pares numa só
+coluna), a inclinação estimada tem alta variância amostral, e essa
+variância é amplificada exponencialmente ao ser composta sobre várias
+colunas futuras não observadas (no corte de 2016-12-31 do backtest,
+13 das 23 colunas são extrapoladas a partir de só 10 observadas). A
+correção é fixar a cauda extrapolada (calculada uma única vez, fora do
+laço de reamostragem) em `bootstrap_reserves`, e reamostrar só o corpo
+observado do triângulo -- prática usual ao combinar bootstrap de
+resíduos com fator de cauda (England; Verrall, 2002).
 """
 function extrapolate_factor_tail(f::Vector{Float64}, n::Vector{Int}; min_pairs::Int=2,
                                   max_pontos_ajuste::Int=6)
@@ -85,7 +108,7 @@ function extrapolate_factor_tail(f::Vector{Float64}, n::Vector{Int}; min_pairs::
     ks = length(ks_elegiveis) > max_pontos_ajuste ?
          ks_elegiveis[(end - max_pontos_ajuste + 1):end] : ks_elegiveis
     f_full = copy(f)
-    if length(ks) < 2
+    flat_fallback = () -> begin
         last_obs = findlast(!isnan, f)
         fallback = last_obs === nothing ? 1.0 : f[last_obs]
         for k in 1:K
@@ -93,10 +116,12 @@ function extrapolate_factor_tail(f::Vector{Float64}, n::Vector{Int}; min_pairs::
         end
         return f_full, (NaN, NaN)
     end
+    length(ks) < 2 && return flat_fallback()
     xs = Float64.(ks)
     ys = [log(f[k] - 1.0) for k in ks]
     xbar, ybar = mean(xs), mean(ys)
     b = sum((xs .- xbar) .* (ys .- ybar)) / sum((xs .- xbar) .^ 2)
+    b >= 0 && return flat_fallback()
     a = ybar - b * xbar
     for k in 1:K
         isnan(f_full[k]) && (f_full[k] = 1.0 + exp(a + b * k))
@@ -357,6 +382,14 @@ gera uma reserva Bornhuetter-Ferguson usando os mesmos fatores
 reamostrados, o que dá a esse método um intervalo de incerteza próprio
 (ausente na formulação determinística usual de BF), reaproveitando o
 mesmo laço de reamostragem. Devolve `(reservas_cl, reservas_bf_ou_nothing, phi)`.
+
+A cauda extrapolada (colunas sem nenhum par observado no triângulo
+original, preenchidas em `f` por `extrapolate_factor_tail`) fica FIXA em
+todas as réplicas; só o corpo observado do triângulo é reamostrado. Sem
+isso, a curva log-linear da cauda seria reajustada a cada réplica com
+poucos pontos (até 2 pares numa só coluna), e essa inclinação instável,
+composta sobre as colunas futuras não observadas, explode a reserva (ver
+docstring de `extrapolate_factor_tail`).
 """
 function bootstrap_reserves(tri::AbstractMatrix{<:Real}, f::Vector{Float64};
                              n_boot::Int=1000, seed::Int=20261102,
@@ -374,6 +407,9 @@ function bootstrap_reserves(tri::AbstractMatrix{<:Real}, f::Vector{Float64};
     latest = [k_vec[i] == 0 ? 0.0 : tri[i, k_vec[i]] for i in 1:n_cohorts]
     tcol = target_col === nothing ? fill(max_dev, n_cohorts) : target_col
     com_bf = prior_rate !== nothing && volume !== nothing
+
+    f_raw0, = dev_factors(tri)
+    tail_cols = isnan.(f_raw0)
 
     rng = MersenneTwister(seed)
     reservas_cl = fill(0.0, n_boot)
@@ -394,8 +430,11 @@ function bootstrap_reserves(tri::AbstractMatrix{<:Real}, f::Vector{Float64};
                 pseudo_cum[i, j] = acc
             end
         end
-        f_star_raw, s_star, n_star = dev_factors(pseudo_cum)
-        f_star, = extrapolate_factor_tail(f_star_raw, n_star)
+        f_star_raw, = dev_factors(pseudo_cum)
+        f_star = copy(f_star_raw)
+        for k in 1:(max_dev - 1)
+            (tail_cols[k] || isnan(f_star[k])) && (f_star[k] = f[k])
+        end
         cdf_star = cdf_to_ultimate(f_star)
 
         total_cl = 0.0
