@@ -54,7 +54,7 @@ function dev_factors(tri::AbstractMatrix{<:Real})
 end
 
 """
-    extrapolate_factor_tail(f, n; min_pairs=2)
+    extrapolate_factor_tail(f, n; min_pairs=2, max_pontos_ajuste=6)
 
 Extrapolação de cauda por curva ajustada em log(f_k - 1) contra a idade k
 (forma de Sherman, padrão em literatura atuarial de cauda), usando só as
@@ -65,10 +65,25 @@ vetor de fatores completo e os coeficientes `(a, b)` da reta ajustada
 (`f_k = 1 + exp(a + b*k)`), ou `(NaN, NaN)` se não houver pontos
 suficientes para ajustar (caso em que a cauda usa o último fator
 observado, sem decaimento adicional, e isso deve ser declarado).
+
+O ajuste usa só as `max_pontos_ajuste` colunas elegíveis mais próximas da
+fronteira de extrapolação (idades mais altas), não todo o histórico
+disponível. Isso segue a prática atuarial usual de apoiar a cauda nas
+últimas diagonais observadas, e evita um viés sistemático quando a
+amostra early-cut só cobre idades em que o padrão de maturação ainda não
+estabilizou (por exemplo, uma curva de incremento que ainda está subindo,
+não caindo): um ajuste sobre todo o histórico extrapola a partir desse
+trecho não representativo e super-estima a velocidade de queda de
+`f_k - 1`, subestimando a cauda e a reserva. Com poucas colunas
+disponíveis (`<= max_pontos_ajuste`), o comportamento é idêntico a usar
+todo o histórico.
 """
-function extrapolate_factor_tail(f::Vector{Float64}, n::Vector{Int}; min_pairs::Int=2)
+function extrapolate_factor_tail(f::Vector{Float64}, n::Vector{Int}; min_pairs::Int=2,
+                                  max_pontos_ajuste::Int=6)
     K = length(f)
-    ks = [k for k in 1:K if !isnan(f[k]) && n[k] >= min_pairs && f[k] > 1.0]
+    ks_elegiveis = [k for k in 1:K if !isnan(f[k]) && n[k] >= min_pairs && f[k] > 1.0]
+    ks = length(ks_elegiveis) > max_pontos_ajuste ?
+         ks_elegiveis[(end - max_pontos_ajuste + 1):end] : ks_elegiveis
     f_full = copy(f)
     if length(ks) < 2
         last_obs = findlast(!isnan, f)
@@ -90,18 +105,23 @@ function extrapolate_factor_tail(f::Vector{Float64}, n::Vector{Int}; min_pairs::
 end
 
 """
-    extrapolate_sigma2_tail(sigma2, n; min_pairs=2)
+    extrapolate_sigma2_tail(sigma2, n; min_pairs=2, max_pontos_ajuste=6)
 
 Mesma lógica de `extrapolate_factor_tail`, aplicada a σ²_k: ajusta
 log(σ²_k) contra a idade k nas colunas com `n[k] >= min_pairs`, e usa a
 curva para preencher as colunas sem dado suficiente. Consistente com a
 extrapolação de cauda dos próprios fatores, em vez da regra
 min(σ²[k+1], σ²[k+1]²) (que não é a extrapolação de Mack e zera a cauda
-prematuramente).
+prematuramente). Usa só as `max_pontos_ajuste` colunas elegíveis mais
+próximas da fronteira de extrapolação, pela mesma razão descrita em
+`extrapolate_factor_tail`.
 """
-function extrapolate_sigma2_tail(sigma2::Vector{Float64}, n::Vector{Int}; min_pairs::Int=2)
+function extrapolate_sigma2_tail(sigma2::Vector{Float64}, n::Vector{Int}; min_pairs::Int=2,
+                                  max_pontos_ajuste::Int=6)
     K = length(sigma2)
-    ks = [k for k in 1:K if !isnan(sigma2[k]) && n[k] >= min_pairs && sigma2[k] > 0]
+    ks_elegiveis = [k for k in 1:K if !isnan(sigma2[k]) && n[k] >= min_pairs && sigma2[k] > 0]
+    ks = length(ks_elegiveis) > max_pontos_ajuste ?
+         ks_elegiveis[(end - max_pontos_ajuste + 1):end] : ks_elegiveis
     sigma2_full = copy(sigma2)
     if length(ks) < 2
         last_obs = findlast(k -> !isnan(sigma2[k]) && sigma2[k] > 0, 1:K)

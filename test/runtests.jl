@@ -138,6 +138,50 @@ using .ChainLadderCredito.ChainLadderCore
         end
     end
 
+    @testset "Cauda log-linear ajustada só nas últimas colunas (viés de avaliação antecipada)" begin
+        # Triângulo determinístico gerado por uma curva de maturação em
+        # sino (h(j) ∝ j^1.6 exp(-j/5), igual à usada na simulação de
+        # safras), sem ruído. O fator f_k verdadeiro, nesse caso, NÃO é
+        # log-linear globalmente: log(f_k - 1) decai muito mais rápido nas
+        # idades iniciais (hazard ainda subindo até o pico em j=8) do que
+        # nas idades maduras (hazard já em queda). Um triângulo com poucas
+        # safras maduras só revela as colunas 1-8 (ainda no trecho que
+        # antecede o pico): ajustar a reta de cauda com TODO esse trecho
+        # extrapola a inclinação íngreme do início, subestimando a cauda.
+        # Restringir o ajuste às colunas mais próximas da fronteira
+        # (`max_pontos_ajuste`) reduz esse viés.
+        shape_a, shape_b = 1.6, 5.0
+        maxk = 16
+        hazard_raw = [(j^shape_a) * exp(-j / shape_b) for j in 1:maxk]
+        hazard = hazard_raw ./ sum(hazard_raw)
+        cum_teorico = cumsum(hazard)
+        f_teorico = [cum_teorico[k + 1] / cum_teorico[k] for k in 1:(maxk - 1)]
+
+        n_cohorts = 9
+        max_dev = 14
+        tri = fill(NaN, n_cohorts, max_dev)
+        for i in 1:n_cohorts
+            idade_max = n_cohorts + 1 - i  # 9,8,...,1: triângulo padrão
+            tri[i, 1] = 100.0
+            for k in 1:(idade_max - 1)
+                tri[i, k + 1] = tri[i, k] * f_teorico[k]
+            end
+        end
+        f_raw, s, n = dev_factors(tri)
+        @test count(isnan, f_raw) == 5  # colunas 9-13 sem nenhum par observado
+
+        f_full, = extrapolate_factor_tail(f_raw, n; max_pontos_ajuste=100)  # equivalente ao comportamento antigo (todo o histórico)
+        f_janela, = extrapolate_factor_tail(f_raw, n; max_pontos_ajuste=4)
+        f_padrao, = extrapolate_factor_tail(f_raw, n)  # max_pontos_ajuste=6 por padrão
+
+        for k in 9:12
+            erro_full = abs(f_full[k] - f_teorico[k])
+            erro_janela = abs(f_janela[k] - f_teorico[k])
+            @test erro_janela < 0.5 * erro_full
+        end
+        @test f_padrao != f_full  # o padrão (janela de 6) já restringe o ajuste, não é mais "todo o histórico"
+    end
+
 end
 
 println("Todos os testes passaram.")
