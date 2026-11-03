@@ -182,6 +182,50 @@ using .ChainLadderCredito.ChainLadderCore
         @test f_padrao != f_full  # o padrão (janela de 6) já restringe o ajuste, não é mais "todo o histórico"
     end
 
+    @testset "Bootstrap não explode com triângulo raso (cauda extrapolada fixa por réplica)" begin
+        # Triângulo bem raso: só 10 das 23 colunas têm par observado (13
+        # extrapoladas), com apenas 2 safras na coluna mais frágil -- o
+        # mesmo padrão do corte de 2016-12-31 do backtest, onde reajustar a
+        # curva de cauda a cada réplica reamostrada fazia a reserva
+        # bootstrap explodir (média de 56,1bi contra 20,45bi do CL
+        # determinístico, cauda direita de centenas de bilhões).
+        shape_a, shape_b = 1.6, 5.0
+        max_dev = 24
+        hazard_raw = [(j^shape_a) * exp(-j / shape_b) for j in 1:max_dev]
+        hazard = hazard_raw ./ sum(hazard_raw)
+        cum_teorico = cumsum(hazard)
+        f_teorico = [cum_teorico[k + 1] / cum_teorico[k] for k in 1:(max_dev - 1)]
+
+        n_cohorts = 10
+        tri = fill(NaN, n_cohorts, max_dev)
+        for i in 1:n_cohorts
+            idade_max = n_cohorts + 1 - i  # 10,9,...,1
+            tri[i, 1] = 1e9
+            for k in 1:(idade_max - 1)
+                tri[i, k + 1] = tri[i, k] * f_teorico[k]
+            end
+        end
+
+        f_raw, s, n = dev_factors(tri)
+        @test count(!isnan, f_raw) == 9  # só colunas 1-9 têm par observado
+        @test n[8] == 2  # a coluna mais frágil usada no ajuste (min_pairs=2)
+        @test n[9] == 1  # só 1 par, abaixo de min_pairs -- observada mas fora do ajuste
+
+        f, = extrapolate_factor_tail(f_raw, n)
+        k_vec = [last_observed_col(tri, i) for i in 1:n_cohorts]
+        tcol = fill(max_dev, n_cohorts)
+        reservas_cl, = bootstrap_reserves(tri, f; n_boot=500, seed=1, target_col=tcol)
+
+        proj = project_chain_ladder(tri, f)
+        reserva_cl_det = sum(proj[i, max_dev] - tri[i, k_vec[i]] for i in 1:n_cohorts if k_vec[i] < max_dev)
+
+        # a média bootstrap deve ficar na vizinhança do CL determinístico, não
+        # ordens de magnitude acima (o bug fazia a média passar de 2,5x o
+        # determinístico, com réplicas isoladas chegando a centenas de vezes)
+        @test mean(reservas_cl) / reserva_cl_det < 1.5
+        @test maximum(reservas_cl) / reserva_cl_det < 10
+    end
+
 end
 
 println("Todos os testes passaram.")
