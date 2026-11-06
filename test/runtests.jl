@@ -182,6 +182,40 @@ using .ChainLadderCredito.ChainLadderCore
         @test f_padrao != f_full  # o padrão (janela de 6) já restringe o ajuste, não é mais "todo o histórico"
     end
 
+    @testset "Bootstrap no triângulo de Taylor/Ashe reproduz erro padrão publicado" begin
+        # Mesmo triângulo do teste de Mack acima. A projeção de cada réplica
+        # bootstrap deve partir da diagonal reamostrada (pseudo_cum[i, k_i]),
+        # não da diagonal observada do triângulo original (England; Verrall,
+        # 1999/2002) -- usar a diagonal observada descarta a incerteza de
+        # parâmetro que a reamostragem do corpo gerou para a última idade
+        # conhecida de cada safra e sub-estima o erro padrão da reserva.
+        raw_rows = [
+            [357848, 1124788, 1735330, 2218270, 2745596, 3319994, 3466336, 3606286, 3833515, 3901463],
+            [352118, 1236139, 2170033, 3353322, 3799067, 4120063, 4647867, 4914039, 5339085],
+            [290507, 1292306, 2218525, 3235179, 3985995, 4132918, 4628910, 4909315],
+            [310608, 1418858, 2195047, 3757447, 4029929, 4381982, 4588268],
+            [443160, 1136350, 2128333, 2897821, 3402672, 3873311],
+            [396132, 1333217, 2180715, 2985752, 3691712],
+            [440832, 1288463, 2419861, 3483130],
+            [359480, 1421128, 2864498],
+            [376686, 1363294],
+            [344014],
+        ]
+        n_cohorts = 10
+        tri = fill(NaN, n_cohorts, n_cohorts)
+        for (i, row) in enumerate(raw_rows), (j, v) in enumerate(row)
+            tri[i, j] = Float64(v)
+        end
+        f, s, n = dev_factors(tri)
+        reservas_cl, = bootstrap_reserves(tri, f; n_boot=20000, seed=1)
+
+        # England (2002) / pacote R ChainLadder (BootChainLadder) relatam um
+        # erro de previsão do bootstrap ODP em torno de 2,95-3,0 milhões
+        # (~16% da reserva de 18.681 mil) para este triângulo.
+        @test std(reservas_cl) ≈ 2_950_000 rtol=0.05
+        @test mean(reservas_cl) ≈ 18_681_000 rtol=0.02
+    end
+
     @testset "Bootstrap não explode com triângulo raso (cauda extrapolada fixa por réplica)" begin
         # Triângulo bem raso: só 10 das 23 colunas têm par observado (13
         # extrapoladas), com apenas 2 safras na coluna mais frágil -- o

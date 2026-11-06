@@ -390,6 +390,13 @@ isso, a curva log-linear da cauda seria reajustada a cada réplica com
 poucos pontos (até 2 pares numa só coluna), e essa inclinação instável,
 composta sobre as colunas futuras não observadas, explode a reserva (ver
 docstring de `extrapolate_factor_tail`).
+
+A projeção do chain ladder em cada réplica parte da diagonal reamostrada
+(`pseudo_cum[i, k_i]`), não da diagonal observada do triângulo original,
+seguindo o padrão de England e Verrall (1999, 2002) para bootstrap ODP.
+Projetar a partir da diagonal observada descarta a incerteza de parâmetro
+que a própria reamostragem do corpo gerou para a última idade conhecida
+de cada safra, e sub-estima a dispersão da reserva projetada.
 """
 function bootstrap_reserves(tri::AbstractMatrix{<:Real}, f::Vector{Float64};
                              n_boot::Int=1000, seed::Int=20261102,
@@ -443,8 +450,9 @@ function bootstrap_reserves(tri::AbstractMatrix{<:Real}, f::Vector{Float64};
             k_i = k_vec[i]
             tc = tcol[i]
             (k_i == 0 || k_i >= tc) && continue
-            mean_cl = latest[i] * cdf_star[k_i] / cdf_star[tc]
-            mu_cl = max(mean_cl - latest[i], 1e-6)
+            latest_star = pseudo_cum[i, k_i]
+            mean_cl = latest_star * cdf_star[k_i] / cdf_star[tc]
+            mu_cl = max(mean_cl - latest_star, 1e-6)
             shape_cl = mu_cl / phi
             ultimate_proc_cl = latest[i] + rand(rng, Gamma(shape_cl, phi))
             total_cl += ultimate_proc_cl - latest[i]
