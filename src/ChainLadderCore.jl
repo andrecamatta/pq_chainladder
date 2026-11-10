@@ -6,8 +6,8 @@ using Random
 
 export last_observed_col, dev_factors, extrapolate_factor_tail, extrapolate_sigma2_tail,
        mack_classical_last_sigma2, observed_sigma2, cdf_to_ultimate, project_chain_ladder,
-       fitted_retro_triangle, pearson_residuals, mack_mseps, bootstrap_reserves,
-       bornhuetter_ferguson, calendar_effect_test
+       fitted_retro_triangle, to_incremental, pearson_residuals, mack_mseps, bootstrap_reserves,
+       bornhuetter_ferguson, calendar_effect_test, diagonal_anova
 
 function last_observed_col(tri::AbstractMatrix{<:Real}, i::Int)
     k = 0
@@ -501,15 +501,20 @@ function bornhuetter_ferguson(tri::AbstractMatrix{<:Real}, f::Vector{Float64},
 end
 
 """
-    calendar_effect_test(tri, f)
+    diagonal_anova(n_cohorts, max_dev, resid)
 
-Teste de efeito de calendário via ANOVA de um fator sobre os resíduos de
-Pearson agrupados por diagonal (idade + safra constante = mesmo
-trimestre-calendário). Devolve a estatística F e o p-valor.
+ANOVA de um fator sobre uma matriz de resíduos quaisquer (não só os de Pearson do
+chain ladder clássico), agrupados por diagonal (idade + safra constante = mesmo
+trimestre-calendário, grupo `d = i + j`). Extraído de `calendar_effect_test` para ser
+reaproveitado no diagnóstico "antes/depois" de `ApcModel` (resíduo do chain ladder
+clássico idade+safra vs. resíduo do modelo com termo de calendário). Devolve a
+estatística F, o p-valor, os graus de liberdade entre/dentro de grupos e
+`frac_sistematica = ss_between / (ss_between + ss_within)`, a fração da soma de
+quadrados do resíduo atribuível à diagonal -- análoga, na escala de resíduos
+padronizados, à fração de variância sistemática que `simulate_multi_segment_triangles`
+define como `beta_s^2` por construção.
 """
-function calendar_effect_test(tri::AbstractMatrix{<:Real}, f::Vector{Float64})
-    n_cohorts, max_dev = size(tri)
-    resid, = pearson_residuals(tri, f)
+function diagonal_anova(n_cohorts::Int, max_dev::Int, resid::AbstractMatrix{<:Real})
     grupos = Dict{Int, Vector{Float64}}()
     for i in 1:n_cohorts, j in 1:max_dev
         isnan(resid[i, j]) && continue
@@ -528,6 +533,24 @@ function calendar_effect_test(tri::AbstractMatrix{<:Real}, f::Vector{Float64})
     ms_within = ss_within / max(df_within, 1)
     f_stat = ms_within > 0 ? ms_between / ms_within : NaN
     p_valor = isnan(f_stat) ? NaN : 1 - cdf(FDist(df_between, df_within), f_stat)
+    ss_total = ss_between + ss_within
+    frac_sistematica = ss_total > 0 ? ss_between / ss_total : NaN
+    return f_stat, p_valor, df_between, df_within, frac_sistematica
+end
+
+"""
+    calendar_effect_test(tri, f)
+
+Teste de efeito de calendário via ANOVA de um fator sobre os resíduos de
+Pearson do chain ladder clássico (idade+safra) agrupados por diagonal (idade + safra
+constante = mesmo trimestre-calendário). Devolve a estatística F, o p-valor e os graus
+de liberdade entre/dentro de grupos (mantém a assinatura original de 4 valores; use
+`diagonal_anova` diretamente para obter também `frac_sistematica`).
+"""
+function calendar_effect_test(tri::AbstractMatrix{<:Real}, f::Vector{Float64})
+    n_cohorts, max_dev = size(tri)
+    resid, = pearson_residuals(tri, f)
+    f_stat, p_valor, df_between, df_within, = diagonal_anova(n_cohorts, max_dev, resid)
     return f_stat, p_valor, df_between, df_within
 end
 

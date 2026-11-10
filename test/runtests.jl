@@ -1,9 +1,12 @@
 using Test
 using Statistics
+using Random
 
 include(joinpath(@__DIR__, "..", "src", "ChainLadderCredito.jl"))
 using .ChainLadderCredito
 using .ChainLadderCredito.ChainLadderCore
+using .ChainLadderCredito.VintageSim
+using .ChainLadderCredito.ApcModel
 
 @testset "ChainLadderCore" begin
 
@@ -258,6 +261,101 @@ using .ChainLadderCredito.ChainLadderCore
         # determinístico, com réplicas isoladas chegando a centenas de vezes)
         @test mean(reservas_cl) / reserva_cl_det < 1.5
         @test maximum(reservas_cl) / reserva_cl_det < 10
+    end
+
+    @testset "ApcModel: fit_apc_calendar recupera idade+safra+beta exatos sem ruído" begin
+        # Triângulo determinístico: incremento = exp(intercepto + safra_efeito[i] +
+        # idade_efeito[j] + beta*fator[t]), sem ruído algum. `fator` é uma função
+        # não-linear do índice de calendário (seno + tendência linear fraca), escolhida
+        # deliberadamente para não ser combinação linear de idade/safra -- é essa
+        # não-linearidade que evita a colinearidade exata idade+safra=período (ver
+        # docstring de `fit_apc_calendar`). Com dado gerado exatamente pelo modelo, o
+        # IRLS deve recuperar os parâmetros a menos de erro numérico de ponto flutuante.
+        n_cohorts = 7
+        max_dev = 7
+        cohort_true = [0.0, 0.3, -0.2, 0.5, -0.4, 0.1, 0.2]
+        age_true = [0.0, 0.6, 0.9, 0.5, 0.2, -0.1, -0.3]
+        beta_true = 0.8
+        intercept_true = log(1000.0)
+        fator = [sin(t / 2.3) + 0.1 * t for t in 1:20]
+
+        calendar_index = zeros(Int, n_cohorts, max_dev)
+        incr = fill(NaN, n_cohorts, max_dev)
+        cum = fill(NaN, n_cohorts, max_dev)
+        for i in 1:n_cohorts, j in 1:(n_cohorts + 1 - i)
+            t = i + j - 1
+            calendar_index[i, j] = t
+            incr[i, j] = exp(intercept_true + cohort_true[i] + age_true[j] + beta_true * fator[t])
+        end
+        for i in 1:n_cohorts
+            acc = 0.0
+            for j in 1:max_dev
+                isnan(incr[i, j]) && continue
+                acc += incr[i, j]
+                cum[i, j] = acc
+            end
+        end
+
+        fit = fit_apc_calendar(cum, calendar_index, fator)
+        @test fit.converged
+        @test fit.beta ≈ beta_true atol=1e-6
+        @test fit.intercept ≈ intercept_true atol=1e-6
+        @test all(isapprox.(fit.cohort_effect, cohort_true; atol=1e-6))
+        @test all(isapprox.(fit.age_effect, age_true; atol=1e-6))
+    end
+
+    @testset "ApcModel: recuperação de beta_s multi-segmento (Vasicek/IRB)" begin
+        # simulate_multi_segment_triangles com beta_s nos dois extremos: beta=0 (sem
+        # exposição ao fator comum, só ruído idiossincrático) e beta=1 (inteiramente
+        # dirigido pelo fator comum, sem ruído). O beta estimado por fit_apc_calendar,
+        # usando o MESMO fator padronizado usado na simulação, deve ficar perto dos
+        # extremos verdadeiros -- não exatamente, porque ainda há ruído Gama no
+        # incremento (cv_incremento), mas a ordem de grandeza e o sinal não podem falhar.
+        scr_taxa = 0.05 .+ 0.02 .* sin.((1:60) ./ 5) .+ 0.001 .* (1:60)
+        n_cohorts = 20
+        betas_true = [0.0, 1.0]
+        segs, z = simulate_multi_segment_triangles(scr_taxa; betas=betas_true, n_cohorts=n_cohorts,
+            max_dev=16, start_idx=8, base_volume_r=fill(1e9, 60), seed=4242)
+
+        fit0 = fit_apc_calendar(segs[1].cum, segs[1].calendar_index, z)
+        fit1 = fit_apc_calendar(segs[2].cum, segs[2].calendar_index, z)
+
+        @test abs(fit0.beta) < 0.25          # beta_true = 0,0: estimado deve ficar perto de zero
+        @test fit1.beta > 0.8                 # beta_true = 1,0: estimado deve ficar perto de um
+        @test fit1.beta > fit0.beta + 0.5      # ordenação correta entre os dois segmentos
+    end
+
+    @testset "ApcModel: diagonal_anova mantém calendar_effect_test (regressão)" begin
+        # calendar_effect_test refatorado para delegar a diagonal_anova -- confere que
+        # os quatro valores devolvidos continuam idênticos aos calculados diretamente
+        # pela ANOVA, no mesmo triângulo determinístico do teste de cauda acima.
+        shape_a, shape_b = 1.6, 5.0
+        maxk = 16
+        hazard_raw = [(j^shape_a) * exp(-j / shape_b) for j in 1:maxk]
+        hazard = hazard_raw ./ sum(hazard_raw)
+        cum_teorico = cumsum(hazard)
+        f_teorico = [cum_teorico[k + 1] / cum_teorico[k] for k in 1:(maxk - 1)]
+        n_cohorts = 9
+        max_dev = 14
+        tri = fill(NaN, n_cohorts, max_dev)
+        for i in 1:n_cohorts
+            idade_max = n_cohorts + 1 - i
+            tri[i, 1] = 100.0
+            for k in 1:(idade_max - 1)
+                tri[i, k + 1] = tri[i, k] * f_teorico[k]
+            end
+        end
+        f_raw, s, n = dev_factors(tri)
+        f, = extrapolate_factor_tail(f_raw, n)
+        resid, = pearson_residuals(tri, f)
+
+        f1, p1, dfb1, dfw1 = calendar_effect_test(tri, f)
+        f2, p2, dfb2, dfw2, frac2 = diagonal_anova(n_cohorts, max_dev, resid)
+        @test f1 ≈ f2
+        @test isnan(p1) == isnan(p2) || p1 ≈ p2
+        @test dfb1 == dfb2
+        @test dfw1 == dfw2
+        @test 0.0 <= frac2 <= 1.0
     end
 
 end
