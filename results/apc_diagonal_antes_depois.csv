@@ -1,0 +1,3 @@
+etapa,f_stat,p_valor,df_entre,df_dentro,frac_sistematica,beta_hat,se_beta
+antes_idade_safra,12.901838336396635,0.0,46,795,0.42743331765189885,NaN,NaN
+depois_idade_safra_calendario,6.459796900811621,0.0,46,795,0.2720784494463251,0.10961930335800467,0.0062806146968240415
