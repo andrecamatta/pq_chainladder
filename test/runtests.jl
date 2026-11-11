@@ -6,6 +6,7 @@ include(joinpath(@__DIR__, "..", "src", "ChainLadderCredito.jl"))
 using .ChainLadderCredito
 using .ChainLadderCredito.ChainLadderCore
 using .ChainLadderCredito.VintageSim
+using .ChainLadderCredito.Backtest
 using .ChainLadderCredito.ApcModel
 
 @testset "ChainLadderCore" begin
@@ -356,6 +357,180 @@ using .ChainLadderCredito.ApcModel
         @test dfb1 == dfb2
         @test dfw1 == dfw2
         @test 0.0 <= frac2 <= 1.0
+    end
+
+    @testset "ApcModel: extrapolate_age_effect_tail recupera decaimento linear sem ruído" begin
+        # age_effect verdadeiro EXATAMENTE linear em j (b_true=-0.3, com age_true[1]=0
+        # -- a categoria de referência de `fit_apc_calendar` é sempre fixada em 0, então
+        # escolher a "verdade" já com age_true[1]=0 evita qualquer ambiguidade de
+        # deslocamento, igual ao teste de recuperação exata acima) sobre TODO o
+        # max_dev, mas só as idades 1..7 são observadas (triângulo padrão, n_cohorts=7
+        # < max_dev=10) -- a mesma situação de um corte antecipado do backtest, em que
+        # idades 8,9,10 ainda não foram observadas por nenhuma safra.
+        n_cohorts = 7
+        max_dev = 10
+        b_true = -0.3
+        age_true = [b_true * (j - 1) for j in 1:max_dev]  # age_true[1] = 0
+        cohort_true = [0.0, 0.3, -0.2, 0.5, -0.4, 0.1, 0.2]
+        beta_true = 0.8
+        intercept_true = log(1000.0)
+        fator = [sin(t / 2.3) + 0.1 * t for t in 1:20]
+
+        calendar_index = zeros(Int, n_cohorts, max_dev)
+        for i in 1:n_cohorts, j in 1:max_dev
+            calendar_index[i, j] = i + j - 1
+        end
+        full_incr = fill(NaN, n_cohorts, max_dev)
+        for i in 1:n_cohorts, j in 1:max_dev
+            t = calendar_index[i, j]
+            full_incr[i, j] = exp(intercept_true + cohort_true[i] + age_true[j] + beta_true * fator[t])
+        end
+        k_vec = [n_cohorts + 1 - i for i in 1:n_cohorts]  # triângulo padrão: só idades 1..(n_cohorts+1-i) observadas
+        cum = fill(NaN, n_cohorts, max_dev)
+        for i in 1:n_cohorts
+            acc = 0.0
+            for j in 1:k_vec[i]
+                acc += full_incr[i, j]
+                cum[i, j] = acc
+            end
+        end
+
+        fit = fit_apc_calendar(cum, calendar_index, fator)
+        @test fit.converged
+        @test fit.idades_presentes == collect(1:n_cohorts)  # idade máxima observada = 7 (safra 1)
+        @test all(isapprox.(fit.age_effect[1:n_cohorts], age_true[1:n_cohorts]; atol=1e-6))
+
+        age_full, (a_hat, b_hat) = extrapolate_age_effect_tail(fit.age_effect, fit.idades_presentes, max_dev)
+        @test b_hat ≈ b_true atol=1e-6
+        @test a_hat ≈ -b_true atol=1e-6  # age_effect[j] = b*(j-1) = b*j - b => intercepto da reta = -b
+        for j in (n_cohorts + 1):max_dev
+            @test age_full[j] ≈ age_true[j] atol=1e-6
+        end
+        # e o ponto projetado herda essa extrapolação (não mais o fallback plano)
+        proj = project_apc_calendar(fit, calendar_index, fator)
+        @test proj[1, max_dev] ≈ exp(intercept_true + cohort_true[1] + age_true[max_dev] + beta_true * fator[max_dev]) atol=1e-3
+    end
+
+    @testset "ApcModel: extrapolate_age_effect_tail cai no fallback plano (poucos pontos ou inclinação não-negativa)" begin
+        # (a) menos de 2 idades elegíveis: cai no fallback plano, devolve (NaN,NaN).
+        # `age_effect` precisa ter comprimento `max_dev` (como `fit.age_effect` sempre
+        # tem, por construção de `fit_apc_calendar`) -- só a idade 2 está "presente".
+        age_effect_1pt = [0.0, 0.7, 0.0, 0.0, 0.0]
+        age_full_1pt, coefs_1pt = extrapolate_age_effect_tail(age_effect_1pt, [2], 5)
+        @test isnan(coefs_1pt[1]) && isnan(coefs_1pt[2])
+        @test age_full_1pt[3] == age_full_1pt[4] == age_full_1pt[5] == age_effect_1pt[2]  # plano, repete a idade 2
+
+        # (b) age_effect CRESCENTE nas últimas idades (inclinação b>0): mesmo guarda de
+        # sinal de `extrapolate_factor_tail` (um efeito que cresce para sempre, em vez
+        # de decair, contradiz a forma de hazard em sino que motiva a extrapolação) --
+        # cai no fallback plano em vez de extrapolar um crescimento sem fundamento.
+        idades = collect(1:6)
+        age_effect_crescente = vcat([0.1 * j for j in 1:6], fill(0.0, 4))  # estritamente crescente até a idade 6
+        age_full_cresc, coefs_cresc = extrapolate_age_effect_tail(age_effect_crescente, idades, 10)
+        @test isnan(coefs_cresc[1]) && isnan(coefs_cresc[2])
+        @test all(age_full_cresc[j] == age_effect_crescente[6] for j in 7:10)
+    end
+
+    @testset "ApcModel: fit_ar1_fator e simulate_fator_future nunca leem o fator depois do corte" begin
+        # Duas séries idênticas até valuation_idx=15, mas com os valores DEPOIS do
+        # corte completamente diferentes (uma crescente, outra com ruído extremo) --
+        # se a função lesse esses valores (vazamento), os parâmetros do AR(1) ou o
+        # caminho simulado variariam entre as duas; devem ser IDÊNTICOS, porque nenhuma
+        # das duas funções deve olhar além de `valuation_idx`.
+        valuation_idx = 15
+        historico = [0.05 * sin(t / 3) + 0.01 * t for t in 1:valuation_idx]
+        fator_a = vcat(historico, [100.0 * t for t in 1:10])         # futuro absurdamente alto
+        fator_b = vcat(historico, [-100.0 * t for t in 1:10])        # futuro absurdamente baixo (e diferente de a)
+        @test fator_a[1:valuation_idx] == fator_b[1:valuation_idx]   # mesma história, por construção
+        @test fator_a[(valuation_idx + 1):end] != fator_b[(valuation_idx + 1):end]
+
+        ca, phia, siga = fit_ar1_fator(fator_a, valuation_idx)
+        cb, phib, sigb = fit_ar1_fator(fator_b, valuation_idx)
+        @test ca ≈ cb atol=1e-12
+        @test phia ≈ phib atol=1e-12
+        @test siga ≈ sigb atol=1e-12
+
+        rng_a = MersenneTwister(2026)
+        rng_b = MersenneTwister(2026)
+        path_a = simulate_fator_future(fator_a, valuation_idx, 22, ca, phia, siga, rng_a)
+        path_b = simulate_fator_future(fator_b, valuation_idx, 22, cb, phib, sigb, rng_b)
+        @test path_a[(valuation_idx + 1):end] ≈ path_b[(valuation_idx + 1):end] atol=1e-12
+        # e nenhum dos dois caminhos simulados chega perto da escala do "futuro" de
+        # entrada (100*t ou -100*t) -- confirma que o caminho é GERADO, não copiado.
+        @test maximum(abs.(path_a[(valuation_idx + 1):end])) < 50.0
+    end
+
+    @testset "ApcModel: Monte Carlo com reestimação de parâmetro é mais largo que o de só processo" begin
+        # Triângulo realista com ruído de processo genuíno (VintageSim, cv_incremento
+        # padrão), um corte intermediário. O Monte Carlo antigo (só processo, mantido
+        # em `montecarlo_apc_reserve_processo` para esta comparação) soma só a
+        # variabilidade Gama em torno da média ajustada; o novo (`montecarlo_apc_reserve`)
+        # também reestima idade+safra+beta por réplica e simula o fator futuro -- deve
+        # produzir um intervalo SEMPRE mais largo (ou igual), nunca mais estreito.
+        scr_taxa = 0.05 .+ 0.02 .* sin.((1:60) ./ 5) .+ 0.001 .* (1:60)
+        n_cohorts = 20
+        sim = simulate_vintage_triangle(scr_taxa; n_cohorts=n_cohorts, max_dev=16, start_idx=8,
+            dilution_factor=2.2, shape_a=1.6, shape_b=5.0, base_volume_r=fill(1e9, 60),
+            origination_share=0.15, cv_incremento=0.15, seed=777)
+        Z = padronizar(fator_calendario_bcb(scr_taxa))
+        v = 20
+        tri = truncate_at_valuation(sim, v)
+        k_vec = [last_observed_col(tri, i) for i in 1:sim.n_cohorts]
+        tcol = sim.max_age_within_horizon
+        fit0 = fit_apc_calendar(tri, sim.calendar_index, Z)
+        @test fit0.phi > 0  # ruído de processo genuíno nesta simulação
+
+        reservas_proc, = montecarlo_apc_reserve_processo(fit0, sim.calendar_index, Z, k_vec, tcol;
+                                                           n_boot=500, seed=1)
+        reservas_novo, = montecarlo_apc_reserve(tri, sim.calendar_index, Z, v, k_vec, tcol;
+                                                 n_boot=500, seed=1)
+        @test std(reservas_novo) > 2 * std(reservas_proc)
+    end
+
+    @testset "ApcModel: Monte Carlo colapsa para o ponto quando não há ruído nenhum" begin
+        # Triângulo determinístico (incremento = exp(apc exato), sem ruído de processo)
+        # e fator de calendário CONSTANTE na história pré-corte (sem variância -- o AR(1)
+        # cai no fallback de ruído branco com sigma=0, ver `fit_ar1_fator`): nem o
+        # bootstrap de resíduos (todos ~0) nem a simulação do fator futuro (sigma=0) têm
+        # de onde tirar variabilidade. O Monte Carlo deve colapsar para um ponto, só com
+        # ruído de arredondamento de ponto flutuante -- prova de que a dispersão medida
+        # no teste anterior vem genuinamente do ruído dos dados, não de algum artefato
+        # numérico interno (ex.: o bug de floor inconsistente do Gamma corrigido nesta
+        # fase, que fazia a reserva EXPLODIR mesmo sem ruído nenhum).
+        n_cohorts = 7
+        max_dev = 10
+        cohort_true = [0.0, 0.3, -0.2, 0.5, -0.4, 0.1, 0.2]
+        age_true = [0.0, 0.6, 0.9, 0.5, 0.2, -0.1, -0.3, -0.5, -0.7, -0.9]
+        beta_true = 0.0
+        intercept_true = log(1000.0)
+        fator = fill(0.1, 20)  # história constante -> AR(1) com sigma=0
+
+        calendar_index = zeros(Int, n_cohorts, max_dev)
+        for i in 1:n_cohorts, j in 1:max_dev
+            calendar_index[i, j] = i + j - 1
+        end
+        full_incr = fill(NaN, n_cohorts, max_dev)
+        for i in 1:n_cohorts, j in 1:max_dev
+            t = calendar_index[i, j]
+            full_incr[i, j] = exp(intercept_true + cohort_true[i] + age_true[j] + beta_true * fator[t])
+        end
+        k_vec = [n_cohorts + 1 - i for i in 1:n_cohorts]
+        cum = fill(NaN, n_cohorts, max_dev)
+        for i in 1:n_cohorts
+            acc = 0.0
+            for j in 1:k_vec[i]
+                acc += full_incr[i, j]
+                cum[i, j] = acc
+            end
+        end
+        tcol = fill(max_dev, n_cohorts)
+        valuation_idx = n_cohorts
+
+        reservas, pontual = montecarlo_apc_reserve(cum, calendar_index, fator, valuation_idx, k_vec, tcol;
+                                                     n_boot=300, seed=1)
+        @test mean(reservas) > 0
+        @test std(reservas) / mean(reservas) < 1e-4  # colapso: só ruído de ponto flutuante
+        @test pontual ≈ mean(reservas) rtol=1e-4
     end
 
 end

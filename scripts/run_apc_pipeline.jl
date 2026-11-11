@@ -7,6 +7,16 @@ using Statistics
 using JSON3
 using Dates
 using Random
+using LinearAlgebra
+
+# A seção 5 paraleliza por semente com Threads.@threads, e cada semente chama
+# fit_apc_calendar (IRLS, resolve `\` via QR do LAPACK) muitas vezes por réplica. BLAS
+# multi-thread chamado de dentro de várias threads Julia simultâneas (threading
+# aninhado) é instável -- pode travar ou (como ocorreu numa execução anterior desta
+# fase, terminada por SIGTERM externo em pleno GC/BLAS) tornar o diagnóstico de uma
+# interrupção externa mais difícil de distinguir de um crash genuíno. Fixar BLAS em 1
+# thread aqui é a prática padrão ao combinar Threads.@threads com álgebra linear.
+BLAS.set_num_threads(1)
 
 include(joinpath(@__DIR__, "..", "src", "ChainLadderCredito.jl"))
 using .ChainLadderCredito
@@ -157,10 +167,13 @@ end
 # ---------------------------------------------------------------------------
 println()
 println("== 4. Cobertura do IC95% com/sem termo de calendário -- 9 cortes (1 semente) ==")
-println("(modelo com calendário usa valores REALIZADOS do fator do BCB no leque de")
-println("previsão -- a série é publicada quase em tempo real, isso não é um oráculo do")
-println("futuro; a limitação declarada é a incerteza de parâmetro ausente no Monte Carlo")
-println("do modelo (c), ver docstring de ApcModel.montecarlo_apc_reserve.)")
+println("(Fase 1b: montecarlo_apc_reserve agora reestima idade+safra+beta por réplica")
+println("(bootstrap de resíduos de Pearson) e NUNCA usa o fator de calendário realizado")
+println("depois do corte dentro do Monte Carlo -- o valor futuro é simulado por um AR(1)")
+println("ajustado só com dado até o corte (ApcModel.fit_ar1_fator/simulate_fator_future).")
+println("'reserva_apc_bi'/'erro_apc_pct' continuam usando o fator REALIZADO (quase-nowcast,")
+println("ver docstring de montecarlo_apc_reserve) só como ponto determinístico; o intervalo")
+println("de cobertura nunca usa esse valor realizado.)")
 
 cuts9 = run_rolling_backtest(sim, VP, scr.taxa, 2.2; n_boot=1000, prior_vies=1.0)
 rows9 = NamedTuple[]
@@ -169,27 +182,36 @@ for (idx, v) in enumerate(VP)
     k_vec = [last_observed_col(tri, i) for i in 1:sim.n_cohorts]
     tcol = sim.max_age_within_horizon
     r = cuts9[idx]
-    local fit, reservas, pontual, cobre_apc, beta_hat, se_beta, erro_apc_pct
+    local fit, reservas, pontual, cobre_apc, beta_hat, se_beta, erro_apc_pct, largura_apc
     try
         fit = fit_apc_calendar(tri, sim.calendar_index, Z)
-        reservas, pontual = montecarlo_apc_reserve(fit, sim.calendar_index, Z, k_vec, tcol;
+        reservas, pontual = montecarlo_apc_reserve(tri, sim.calendar_index, Z, v, k_vec, tcol;
                                                      n_boot=1000, seed=20261102 + v)
         q = quantile(reservas, [0.025, 0.975])
         cobre_apc = q[1] <= r.reserva_real <= q[2]
+        largura_apc = q[2] - q[1]
         beta_hat, se_beta = fit.beta, fit.se_beta
         erro_apc_pct = 100 * (pontual - r.reserva_real) / r.reserva_real
         push!(rows9, (data=scr.data_base[v], reserva_real_bi=r.reserva_real / 1e9,
                        reserva_cl_bi=r.reserva_cl / 1e9, reserva_apc_bi=pontual / 1e9,
                        erro_cl_pct=r.erro_cl_pct, erro_apc_pct=erro_apc_pct,
                        cobertura_mack_95=r.coverage_mack_95, cobertura_boot_cl_95=r.coverage_boot_cl_95,
-                       cobertura_apc_95=cobre_apc, beta_hat=beta_hat, se_beta=se_beta,
+                       cobertura_apc_95=cobre_apc,
+                       largura_mack_bi=2 * 1.96 * r.reserva_mack_se / 1e9,
+                       largura_boot_cl_bi=(r.reserva_boot_cl_q975 - r.reserva_boot_cl_q025) / 1e9,
+                       largura_apc_bi=largura_apc / 1e9,
+                       beta_hat=beta_hat, se_beta=se_beta,
                        n_obs_fit=fit.n_obs, ajuste_ok=true))
     catch e
         push!(rows9, (data=scr.data_base[v], reserva_real_bi=r.reserva_real / 1e9,
                        reserva_cl_bi=r.reserva_cl / 1e9, reserva_apc_bi=NaN,
                        erro_cl_pct=r.erro_cl_pct, erro_apc_pct=NaN,
                        cobertura_mack_95=r.coverage_mack_95, cobertura_boot_cl_95=r.coverage_boot_cl_95,
-                       cobertura_apc_95=false, beta_hat=NaN, se_beta=NaN,
+                       cobertura_apc_95=false,
+                       largura_mack_bi=2 * 1.96 * r.reserva_mack_se / 1e9,
+                       largura_boot_cl_bi=(r.reserva_boot_cl_q975 - r.reserva_boot_cl_q025) / 1e9,
+                       largura_apc_bi=NaN,
+                       beta_hat=NaN, se_beta=NaN,
                        n_obs_fit=0, ajuste_ok=false))
     end
 end
@@ -197,19 +219,28 @@ df_9cortes = DataFrame(rows9)
 CSV.write(joinpath(RESULTS, "apc_cobertura_9cortes.csv"), df_9cortes)
 println(df_9cortes)
 println("Cobertura (1 semente) -- Mack: ", sum(df_9cortes.cobertura_mack_95), "/9 | bootstrap CL: ",
-        sum(df_9cortes.cobertura_boot_cl_95), "/9 | modelo (c), Monte Carlo de processo: ",
+        sum(df_9cortes.cobertura_boot_cl_95), "/9 | modelo (c), Monte Carlo com reestimação de parâmetro: ",
         sum(df_9cortes.cobertura_apc_95), "/9")
+println("Largura média do IC95% (bi) -- Mack: ", round(mean(df_9cortes.largura_mack_bi), digits=2),
+        " | bootstrap CL: ", round(mean(df_9cortes.largura_boot_cl_bi), digits=2),
+        " | modelo (c): ", round(mean(filter(!isnan, df_9cortes.largura_apc_bi)), digits=2))
 
 # ---------------------------------------------------------------------------
 println()
 println("== 5. Experimento de 200 sementes: cobertura média com/sem termo de calendário ==")
+println("(n_boot do modelo (c) reduzido para 150 réplicas por corte/semente -- em vez de")
+println("500 na Fase 1 -- porque a Fase 1b reestima idade+safra+beta por réplica (ajuste")
+println("IRLS completo), não só soma ruído de processo; custo computacional declarado, não")
+println("escondido. Paralelizado por semente em Threads.nthreads()=", Threads.nthreads(),
+        " threads.)")
 NSEEDS = 200
+N_BOOT_200 = 150
 cobertura_mack = zeros(NSEEDS, length(VP))
 cobertura_bootcl = zeros(NSEEDS, length(VP))
-cobertura_apc = zeros(NSEEDS, length(VP))
-ajuste_falhou = zeros(Int, length(VP))
+cobertura_apc = fill(NaN, NSEEDS, length(VP))
+largura_apc = fill(NaN, NSEEDS, length(VP))
 
-for sd in 1:NSEEDS
+Threads.@threads for sd in 1:NSEEDS
     sim_s = simulate_vintage_triangle(scr.taxa; n_cohorts=N_COHORTS, max_dev=MAX_DEV, start_idx=START_IDX,
                                        dilution_factor=2.2, shape_a=1.6, shape_b=5.0,
                                        base_volume_r=scr.carteira_ativa, origination_share=0.15,
@@ -223,23 +254,24 @@ for sd in 1:NSEEDS
         k_vec = [last_observed_col(tri, i) for i in 1:sim_s.n_cohorts]
         tcol = sim_s.max_age_within_horizon
         try
-            fit_s = fit_apc_calendar(tri, sim_s.calendar_index, Z)
-            reservas_s, = montecarlo_apc_reserve(fit_s, sim_s.calendar_index, Z, k_vec, tcol;
-                                                  n_boot=500, seed=20261102 + v + 1000 * sd)
+            reservas_s, = montecarlo_apc_reserve(tri, sim_s.calendar_index, Z, v, k_vec, tcol;
+                                                   n_boot=N_BOOT_200, seed=20261102 + v + 1000 * sd)
             q_s = quantile(reservas_s, [0.025, 0.975])
             cobertura_apc[sd, k] = q_s[1] <= r.reserva_real <= q_s[2]
+            largura_apc[sd, k] = q_s[2] - q_s[1]
         catch
-            ajuste_falhou[k] += 1
             cobertura_apc[sd, k] = NaN
         end
     end
 end
+ajuste_falhou = [count(isnan, cobertura_apc[:, k]) for k in eachindex(VP)]
 
 df_200 = DataFrame(
     data=[scr.data_base[v] for v in VP],
     cobertura_mack_media=[mean(cobertura_mack[:, k]) for k in eachindex(VP)],
     cobertura_boot_cl_media=[mean(cobertura_bootcl[:, k]) for k in eachindex(VP)],
     cobertura_apc_media=[mean(filter(!isnan, cobertura_apc[:, k])) for k in eachindex(VP)],
+    largura_apc_media_bi=[mean(filter(!isnan, largura_apc[:, k])) / 1e9 for k in eachindex(VP)],
     n_sementes_ajuste_falhou=ajuste_falhou,
 )
 CSV.write(joinpath(RESULTS, "apc_cobertura_200sementes.csv"), df_200)
@@ -308,6 +340,11 @@ resumo = Dict(
     "cobertura_200sem_mack_media" => mean(df_200.cobertura_mack_media),
     "cobertura_200sem_boot_cl_media" => mean(df_200.cobertura_boot_cl_media),
     "cobertura_200sem_apc_media" => mean(df_200.cobertura_apc_media),
+    "largura_9cortes_mack_media_bi" => mean(df_9cortes.largura_mack_bi),
+    "largura_9cortes_boot_cl_media_bi" => mean(df_9cortes.largura_boot_cl_bi),
+    "largura_9cortes_apc_media_bi" => mean(filter(!isnan, df_9cortes.largura_apc_bi)),
+    "largura_200sem_apc_media_bi" => mean(df_200.largura_apc_media_bi),
+    "n_boot_200sem_apc" => N_BOOT_200,
     "n_sementes_200" => NSEEDS,
     "n_sementes_segmentos" => NSEEDS_SEG,
     "betas_verdadeiros" => BETAS_TRUE,

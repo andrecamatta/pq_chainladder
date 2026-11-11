@@ -9,7 +9,8 @@ using ..VintageSim
 using ..Backtest
 
 export fit_apc_calendar, project_apc_calendar, estimate_free_period_effects,
-       decompose_calendar_deviation, montecarlo_apc_reserve
+       decompose_calendar_deviation, montecarlo_apc_reserve, montecarlo_apc_reserve_processo,
+       extrapolate_age_effect_tail, fit_ar1_fator, simulate_fator_future
 
 """
     fit_apc_calendar(tri, calendar_index, fator; max_iter=50, tol=1e-8)
@@ -142,6 +143,71 @@ function fit_apc_calendar(tri::AbstractMatrix{<:Real}, calendar_index::Matrix{In
 end
 
 """
+    extrapolate_age_effect_tail(age_effect, idades_presentes, max_dev; max_pontos_ajuste=6)
+
+Extrapolação de cauda do efeito de idade do modelo (c), para idades `j` MAIORES que
+`maximum(idades_presentes)` -- a mesma situação que `ChainLadderCore.extrapolate_factor_tail`
+resolve para os fatores de desenvolvimento do chain ladder clássico, com o mesmo
+critério (Fase 1b, corrigindo a simplificação plana da Fase 1 -- ver
+`apc_fase1_resumo.md`, seção 2.4): ajusta uma reta em `age_effect[j]` contra `j`,
+usando só as últimas `max_pontos_ajuste` idades elegíveis (as mais próximas da
+fronteira de extrapolação, igual à janela de `extrapolate_factor_tail`), e força a
+reta a ser não-crescente (`b <= 0`, mesmo guarda de sinal). Com menos de dois pontos
+elegíveis ou inclinação positiva, cai no fallback plano (repete o efeito da idade
+máxima observada) -- o mesmo fallback que ERA o comportamento único da Fase 1, usado
+agora só como caso-limite, não como regra geral.
+
+Diferença em relação a `extrapolate_factor_tail`: ali a reta é ajustada em
+`log(f_k - 1)`, porque `f_k` é um fator multiplicativo e só o excesso sobre 1 decai
+geometricamente. Aqui `age_effect[j]` já está na escala log (é o termo aditivo de
+`log(mu[i,j])` no GLM), então a reta é ajustada DIRETAMENTE sobre `age_effect[j]`, sem
+precisar de outro log: um `age_effect` que decai linearmente em `j` já corresponde a
+um incremento esperado que decai geometricamente em `j` (`mu_{j+1}/mu_j = exp(b)`
+constante), o análogo em escala log do que `f_k -> 1` representa em escala
+multiplicativa.
+
+Idades `j` MENORES que `minimum(idades_presentes)` (não deveria ocorrer em uso
+normal -- ver docstring de `fit_apc_calendar`) continuam usando o fallback plano
+(efeito da idade mínima observada): não há razão para supor decaimento geométrico
+"para trás" no tempo de maturação, então não se estende a mesma extrapolação.
+
+Devolve `(age_effect_full, (a, b))`, com `(a, b) = (NaN, NaN)` se o fallback plano foi
+usado (incluindo o caso em que não há nada para extrapolar, `age_max >= max_dev`).
+"""
+function extrapolate_age_effect_tail(age_effect::Vector{Float64}, idades_presentes::Vector{Int},
+                                      max_dev::Int; max_pontos_ajuste::Int=6)
+    age_full = copy(age_effect)
+    isempty(idades_presentes) && return age_full, (NaN, NaN)
+    age_min, age_max = minimum(idades_presentes), maximum(idades_presentes)
+    for j in 1:(age_min - 1)
+        age_full[j] = age_effect[age_min]
+    end
+    age_max >= max_dev && return age_full, (NaN, NaN)
+
+    flat_fallback = () -> begin
+        for j in (age_max + 1):max_dev
+            age_full[j] = age_effect[age_max]
+        end
+        return age_full, (NaN, NaN)
+    end
+    ks = length(idades_presentes) > max_pontos_ajuste ?
+         idades_presentes[(end - max_pontos_ajuste + 1):end] : idades_presentes
+    length(ks) < 2 && return flat_fallback()
+    xs = Float64.(ks)
+    ys = [age_effect[j] for j in ks]
+    xbar, ybar = mean(xs), mean(ys)
+    sxx = sum((xs .- xbar) .^ 2)
+    sxx <= 0 && return flat_fallback()
+    b = sum((xs .- xbar) .* (ys .- ybar)) / sxx
+    b > 0 && return flat_fallback()
+    a = ybar - b * xbar
+    for j in (age_max + 1):max_dev
+        age_full[j] = a + b * j
+    end
+    return age_full, (a, b)
+end
+
+"""
     project_apc_calendar(fit, calendar_index, fator)
 
 Projeta o incremento esperado em todas as células (`exp(intercepto + safra_efeito[i] +
@@ -149,30 +215,25 @@ idade_efeito[j] + beta*fator[t])`), inclusive fora da janela usada para ajustar 
 -- é o que permite ao chamador decidir se usa valores de `fator` realizados (a
 situação real: a série do SCR.data é publicada quase em tempo real, então os
 trimestres entre a data de avaliação e a data de corte do calendário já são
-conhecidos quando chegam, não precisam ser previstos) ou hipotéticos. Células com
-`calendar_index == 0` ou `fator` indefinido (`NaN`) ficam `NaN`.
+conhecidos quando chegam, não precisam ser previstos) ou hipotéticos, inclusive
+simulados (ver `montecarlo_apc_reserve`). Células com `calendar_index == 0` ou
+`fator` indefinido (`NaN`) ficam `NaN`.
 
-Para idades `j` fora de `fit.idades_presentes` (idades ainda não observadas em
-nenhuma safra na data do ajuste -- a mesma situação que `extrapolate_factor_tail`
-resolve para o chain ladder clássico), usa o efeito de idade da idade mais próxima
-DENTRO de `fit.idades_presentes` (extrapolação plana, mais simples que a extrapolação
-log-linear do chain ladder clássico -- declarado aqui como simplificação da Fase 1,
-não como escolha definitiva: uma cauda log-linear análoga para o modelo (c) é
-trabalho futuro). Para safras `i` fora de `fit.cohorts_presentes`, o efeito fica 0,0 por
+Para idades `j` fora de `fit.idades_presentes`, usa `extrapolate_age_effect_tail`
+(decaimento log-linear acima da idade máxima observada, Fase 1b; fallback plano abaixo
+da mínima). Para safras `i` fora de `fit.cohorts_presentes`, o efeito fica 0,0 por
 definição (não deveria ocorrer em uso normal: toda safra com célula a projetar tem,
 por construção, pelo menos uma célula observada mais nova).
 """
 function project_apc_calendar(fit, calendar_index::Matrix{Int}, fator::Vector{Float64})
     n_cohorts, max_dev = size(calendar_index)
     proj = fill(NaN, n_cohorts, max_dev)
-    idades = fit.idades_presentes
-    age_min, age_max = isempty(idades) ? (1, max_dev) : (minimum(idades), maximum(idades))
+    age_effect_full, = extrapolate_age_effect_tail(fit.age_effect, fit.idades_presentes, max_dev)
     for i in 1:n_cohorts, j in 1:max_dev
         t = calendar_index[i, j]
         t == 0 && continue
         (t > length(fator) || isnan(fator[t])) && continue
-        j_efetivo = clamp(j, age_min, age_max)
-        proj[i, j] = exp(fit.intercept + fit.cohort_effect[i] + fit.age_effect[j_efetivo] + fit.beta * fator[t])
+        proj[i, j] = exp(fit.intercept + fit.cohort_effect[i] + age_effect_full[j] + fit.beta * fator[t])
     end
     return proj
 end
@@ -272,33 +333,28 @@ function decompose_calendar_deviation(sim::SimTriangle, valuation_idx::Int)
 end
 
 """
-    montecarlo_apc_reserve(fit, calendar_index, fator, k_vec, tcol; n_boot=1000, seed=20261102)
+    montecarlo_apc_reserve_processo(fit, calendar_index, fator, k_vec, tcol; n_boot=1000, seed=20261102)
 
-Distribuição preditiva Monte Carlo da reserva do modelo (c) (idade+safra+β·fator),
-projetando cada célula futura (`j` entre `k_vec[i]+1` e `tcol[i]`) com
-`mu[i,j] = project_apc_calendar(fit, calendar_index, fator)[i,j]` e somando uma
-amostra `Gamma(mu[i,j]/phi, phi)` por célula (mesma família usada na etapa de
-incerteza de processo de `ChainLadderCore.bootstrap_reserves`).
+Versão da Fase 1 (mantida só para comparação/regressão -- ver teste "Monte Carlo com
+reestimação de parâmetro é mais largo que o de só processo"; não usada no pipeline de
+produção do relatório de cobertura). Distribuição preditiva Monte Carlo da reserva do
+modelo (c), projetando cada célula futura (`j` entre `k_vec[i]+1` e `tcol[i]`) com
+`mu[i,j] = project_apc_calendar(fit, calendar_index, fator)[i,j]` e somando uma amostra
+`Gamma(mu[i,j]/phi, phi)` por célula (mesma família usada na etapa de incerteza de
+processo de `ChainLadderCore.bootstrap_reserves`).
 
-**Limitação declarada, importante para a leitura da cobertura medida:** os parâmetros
-do modelo (`intercept`, `cohort_effect`, `age_effect`, `beta`) ficam FIXOS no valor
-estimado da amostra observada -- esta função soma só incerteza de PROCESSO (a
-variabilidade Gama em torno da média ajustada), não a incerteza de ESTIMAÇÃO dos
-próprios parâmetros, ao contrário do bootstrap do chain ladder clássico
-(`bootstrap_reserves`), que reestima os fatores de desenvolvimento a cada réplica
-reamostrando o corpo do triângulo. Isso tende a SUBESTIMAR a incerteza total do
-modelo (c) e, portanto, a INFLAR a cobertura medida do intervalo resultante -- a
-comparação "com calendário" vs. "sem calendário" (`bootstrap_reserves`,
-que soma incerteza de processo E de parâmetro) não está em igualdade de condições, e
-deve ser lida como um limite otimista para o modelo (c), não uma comparação justa.
-Fazer o modelo (c) reestimar os parâmetros a cada réplica (como o chain ladder
-clássico já faz) é a extensão natural para uma Fase 2, não implementada aqui por
-custo computacional (um ajuste IRLS por réplica, multiplicado por milhares de
-réplicas e centenas de sementes).
+**Limitação declarada (Fase 1, corrigida em `montecarlo_apc_reserve`, Fase 1b -- ver
+`apc_fase1b_resumo.md`):** os parâmetros do modelo (`intercept`, `cohort_effect`,
+`age_effect`, `beta`) ficam FIXOS no valor estimado da amostra observada -- esta
+função soma só incerteza de PROCESSO, não a incerteza de ESTIMAÇÃO dos próprios
+parâmetros nem a incerteza sobre o valor futuro de `fator` (que aqui é tratado como se
+fosse conhecido com certeza, mesmo nas células do leque de previsão). Isso SUBESTIMA a
+incerteza total do modelo (c) -- é exatamente a causa da cobertura de 0/9 medida na
+Fase 1 (1,2% em 200 sementes), documentada em `apc_fase1_resumo.md`, seção 2.4.
 """
-function montecarlo_apc_reserve(fit, calendar_index::Matrix{Int}, fator::Vector{Float64},
-                                 k_vec::Vector{Int}, tcol::Vector{Int};
-                                 n_boot::Int=1000, seed::Int=20261102)
+function montecarlo_apc_reserve_processo(fit, calendar_index::Matrix{Int}, fator::Vector{Float64},
+                                          k_vec::Vector{Int}, tcol::Vector{Int};
+                                          n_boot::Int=1000, seed::Int=20261102)
     mu = project_apc_calendar(fit, calendar_index, fator)
     n_cohorts = length(k_vec)
     mus = Float64[]
@@ -321,6 +377,231 @@ function montecarlo_apc_reserve(fit, calendar_index::Matrix{Int}, fator::Vector{
         reservas[b] = total
     end
     return reservas, sum(mus)
+end
+
+"""
+    fit_ar1_fator(fator, valuation_idx; min_obs=8)
+
+Ajusta um AR(1) ingênuo (`fator_t = c + phi·fator_{t-1} + erro_t`) à série do fator de
+calendário, por mínimos quadrados ordinários, usando SÓ os pares `(fator_{t-1},
+fator_t)` com `t <= valuation_idx` -- nunca um valor realizado depois do corte. É essa
+restrição que `simulate_fator_future` usa para simular o valor futuro do fator sem
+vazamento (ver docstring de `montecarlo_apc_reserve`): o processo é ajustado só com
+dado que já seria conhecido na data de avaliação.
+
+Com menos de `min_obs` pares disponíveis (corte muito raso), variância amostral nula
+nos regressores, ou `phi` fora de `[-0.98, 0.98]` (processo quase não-estacionário --
+ajuste instável com poucos pontos, o mesmo tipo de guarda de sinal usado em
+`extrapolate_factor_tail` para a inclinação da cauda), cai no fallback de ruído
+branco: `phi=0`, `c` = média do histórico até o corte, `sigma` = desvio-padrão do
+histórico até o corte. Isso é uma simplificação deliberada sobre a dinâmica do fator,
+declarada, não escondida: um AR(1) não é o processo verdadeiro do ciclo de
+inadimplência agregada (que não precisa ser identificado aqui) -- o objetivo é só
+propagar incerteza genuína sobre o valor futuro do fator para o intervalo do modelo
+(c), não prever o SCR.data.
+
+Devolve `(c, phi, sigma)`. `sigma` é o desvio-padrão dos resíduos do ajuste (ou do
+histórico, no fallback) -- usado por `simulate_fator_future` como a escala do ruído
+gaussiano por passo.
+"""
+function fit_ar1_fator(fator::Vector{Float64}, valuation_idx::Int; min_obs::Int=8)
+    hist = [fator[t] for t in 1:min(valuation_idx, length(fator)) if !isnan(fator[t])]
+    fallback = () -> (isempty(hist) ? 0.0 : mean(hist), 0.0, isempty(hist) ? 0.0 : std(hist))
+    pares = Tuple{Float64,Float64}[]
+    for t in 2:min(valuation_idx, length(fator))
+        (isnan(fator[t - 1]) || isnan(fator[t])) && continue
+        push!(pares, (fator[t - 1], fator[t]))
+    end
+    length(pares) < min_obs && return fallback()
+    xs = [p[1] for p in pares]
+    ys = [p[2] for p in pares]
+    xbar, ybar = mean(xs), mean(ys)
+    sxx = sum((xs .- xbar) .^ 2)
+    sxx <= 0 && return fallback()
+    phi = sum((xs .- xbar) .* (ys .- ybar)) / sxx
+    (phi < -0.98 || phi > 0.98) && return fallback()
+    c = ybar - phi * xbar
+    resid = ys .- (c .+ phi .* xs)
+    dof = max(length(pares) - 2, 1)
+    sigma = sqrt(sum(resid .^ 2) / dof)
+    return c, phi, sigma
+end
+
+"""
+    simulate_fator_future(fator, valuation_idx, max_t, c, phi, sigma, rng)
+
+Simula um caminho do fator de calendário para os índices `valuation_idx+1` até
+`max_t`, ancorado no último valor REALIZADO e conhecido na data de corte
+(`fator[valuation_idx]`, ou o mais recente anterior não-`NaN`) e propagado pelo AR(1)
+`(c, phi, sigma)` -- tipicamente o devolvido por `fit_ar1_fator(fator, valuation_idx)`,
+ajustado só com dado até o corte. Cada chamada usa innovações aleatórias novas (via
+`rng`), então cada réplica do Monte Carlo (`montecarlo_apc_reserve`) simula um caminho
+futuro DIFERENTE -- é isso que captura a incerteza genuína sobre o valor futuro do
+fator, desconhecido no momento do corte.
+
+Os índices `<= valuation_idx` do vetor devolvido são cópias de `fator` (não usados na
+projeção futura, mas preenchidos para nunca devolver `NaN` onde o valor é na verdade
+conhecido). **Nunca lê `fator[t]` para `t > valuation_idx`** -- mesmo que o vetor
+completo (com os valores realmente realizados depois do corte) seja passado por
+conveniência pelo chamador, esta função ignora essas entradas por construção: é a
+garantia de ausência de vazamento exigida no plano de reenquadramento (Fase 1b).
+Índices maiores que `max_t` não são preenchidos (ficam `NaN`): o chamador só precisa
+do caminho até a maior idade de calendário do leque de previsão daquele corte.
+"""
+function simulate_fator_future(fator::Vector{Float64}, valuation_idx::Int, max_t::Int,
+                                c::Float64, phi::Float64, sigma::Float64, rng::AbstractRNG)
+    path = fill(NaN, max_t)
+    limite_hist = min(valuation_idx, length(fator), max_t)
+    for t in 1:limite_hist
+        path[t] = fator[t]
+    end
+    last_known = min(valuation_idx, length(fator))
+    while last_known > 0 && isnan(fator[last_known])
+        last_known -= 1
+    end
+    anterior = last_known > 0 ? fator[last_known] : 0.0
+    for t in (valuation_idx + 1):max_t
+        anterior = c + phi * anterior + sigma * randn(rng)
+        path[t] = anterior
+    end
+    return path
+end
+
+"""
+    montecarlo_apc_reserve(tri, calendar_index, fator, valuation_idx, k_vec, tcol;
+                            n_boot=1000, seed=20261102)
+
+Distribuição preditiva Monte Carlo da reserva do modelo (c) (idade+safra+β·fator),
+corrigindo as duas simplificações da Fase 1 declaradas em `apc_fase1_resumo.md`,
+seção 2.4 (cobertura medida de 0/9 cortes, 1,2% em 200 sementes). Cada réplica soma
+TRÊS fontes de incerteza, nunca lendo o valor realizado do fator depois do corte:
+
+1. **Incerteza de parâmetro**: os resíduos de Pearson do ajuste original
+   (`fit_apc_calendar(tri, calendar_index, fator)`) são reamostrados para gerar um
+   pseudo-triângulo (`pseudo_incr[i,j] = max(fitted[i,j] + e*_[i,j]·ajuste·sqrt(fitted[i,j]),
+   1e-6)`, mesmo esquema de `ChainLadderCore.bootstrap_reserves`), e o modelo
+   (intercepto, idade, safra, β) é REESTIMADO por IRLS a cada réplica, sobre esse
+   pseudo-triângulo -- só com dado até `valuation_idx` (o pseudo-triângulo é
+   construído célula a célula só onde `tri` tinha dado observado).
+2. **Incerteza sobre o valor FUTURO do fator de calendário**: um AR(1) ingênuo
+   (`fit_ar1_fator`) é ajustado UMA VEZ, só com `fator[t]` para `t <= valuation_idx`
+   (nunca o valor realizado depois do corte). Cada réplica simula um caminho diferente
+   (`simulate_fator_future`, innovações novas) a partir do último valor conhecido --
+   paralelo ao que `bootstrap_reserves` faz ao fixar a extrapolação de cauda dos
+   fatores de desenvolvimento UMA VEZ fora do laço (reajustar uma curva instável a
+   cada réplica, com poucos pontos, é o que causava a explosão corrigida em
+   `extrapolate_factor_tail`): aqui o que fica fixo são os PARÂMETROS do AR(1), não o
+   caminho -- o caminho simulado varia por réplica, que é o ponto central desta
+   correção.
+3. **Incerteza de processo**: amostra `Gamma(mu[i,j]/phi_b, phi_b)` por célula futura
+   (mesma família de antes), com `phi_b` o parâmetro de dispersão REESTIMADO na
+   réplica (não o original).
+
+Se o reajuste IRLS de uma réplica falhar (`fit_apc_calendar` lança erro -- ex.:
+colinearidade degenerada num pseudo-triângulo raro), a réplica usa o ajuste original
+(`fit0`) em vez de descartar a réplica, para não enviesar a cauda da distribuição
+resultante por exclusão seletiva.
+
+`valuation_idx` é o índice de calendário da diagonal de corte: necessário para saber
+até onde `fator` é conhecido (nunca depois disso, nem na reestimação dos parâmetros do
+modelo nem no ajuste do AR(1)) e a partir de onde a simulação do caminho futuro deve
+começar. Internamente, `fator` é copiado para `fator_seguro` com as entradas em
+`t > valuation_idx` substituídas por `NaN` antes de qualquer ajuste -- uma segunda
+camada de proteção contra vazamento, redundante com a verificação de índice em
+`fit_apc_calendar` (que só lê `fator` nas células observadas de `tri`, todas com
+`calendar_index <= valuation_idx` por construção de `Backtest.truncate_at_valuation`),
+mas explícita e auditável por si só.
+
+Devolve `(reservas, pontual)`: `reservas` é o vetor de `n_boot` reservas simuladas --
+este é o objeto a comparar contra Mack/bootstrap CL na cobertura, e NUNCA usa o fator
+realizado em nenhuma réplica. `pontual` é a reserva projetada com os parâmetros
+estimados na amostra original (sem reestimar) e o valor REALIZADO do fator no leque de
+previsão (a mesma projeção pontual "quase-nowcast" já usada no pipeline da Fase 1,
+porque o SCR.data é publicado perto de tempo real -- ver comentário em
+`scripts/run_apc_pipeline.jl`): serve só para o erro percentual determinístico do
+modelo (c) nas tabelas do pipeline, nunca para o intervalo.
+"""
+function montecarlo_apc_reserve(tri::AbstractMatrix{<:Real}, calendar_index::Matrix{Int},
+                                 fator::Vector{Float64}, valuation_idx::Int,
+                                 k_vec::Vector{Int}, tcol::Vector{Int};
+                                 n_boot::Int=1000, seed::Int=20261102)
+    n_cohorts, max_dev = size(tri)
+    fator_seguro = [t <= valuation_idx ? fator[t] : NaN for t in eachindex(fator)]
+
+    fit0 = fit_apc_calendar(tri, calendar_index, fator_seguro)
+    proj0_oracle = project_apc_calendar(fit0, calendar_index, fator)
+    pontual = 0.0
+    for i in 1:n_cohorts
+        k_vec[i] == 0 && continue
+        for j in (k_vec[i] + 1):tcol[i]
+            isnan(proj0_oracle[i, j]) && continue
+            pontual += proj0_oracle[i, j]
+        end
+    end
+
+    max_t_needed = valuation_idx
+    for i in 1:n_cohorts
+        k_vec[i] == 0 && continue
+        for j in (k_vec[i] + 1):tcol[i]
+            ci = calendar_index[i, j]
+            ci > max_t_needed && (max_t_needed = ci)
+        end
+    end
+
+    c_ar, phi_ar, sigma_ar = fit_ar1_fator(fator_seguro, valuation_idx)
+
+    valid_idx = [(i, j) for i in 1:n_cohorts, j in 1:max_dev if !isnan(fit0.resid[i, j])]
+    valid_resid = [fit0.resid[i, j] for (i, j) in valid_idx]
+    adj = sqrt(fit0.n_obs / fit0.dof)
+
+    rng = MersenneTwister(seed)
+    reservas = fill(0.0, n_boot)
+    for b in 1:n_boot
+        pseudo_incr = fill(NaN, n_cohorts, max_dev)
+        for (i, j) in valid_idx
+            e_star = valid_resid[rand(rng, 1:length(valid_resid))]
+            fm = max(fit0.fitted_incr[i, j], 1e-6)
+            pseudo_incr[i, j] = max(fm + e_star * adj * sqrt(fm), 1e-6)
+        end
+        pseudo_cum = fill(NaN, n_cohorts, max_dev)
+        for i in 1:n_cohorts
+            k_vec[i] == 0 && continue
+            acc = 0.0
+            for j in 1:k_vec[i]
+                acc += pseudo_incr[i, j]
+                pseudo_cum[i, j] = acc
+            end
+        end
+
+        fit_b = try
+            fit_apc_calendar(pseudo_cum, calendar_index, fator_seguro)
+        catch
+            fit0
+        end
+        # fit_b.phi é usado como shape (mu/phi_b) E como scale do mesmo Gamma: tem que
+        # ser o MESMO valor floorado nos dois lugares (ver chamada abaixo). Floorar só a
+        # scale e deixar o shape usar o phi_b não-floorado (bug corrigido nesta fase)
+        # desacopla média=shape*scale do mu pretendido por várias ordens de grandeza
+        # quando phi_b é minúsculo (ex.: triângulo quase sem ruído de processo).
+        phi_b = max(fit_b.phi > 0 ? fit_b.phi : fit0.phi, 1e-10)
+
+        fator_sim = simulate_fator_future(fator_seguro, valuation_idx, max_t_needed,
+                                           c_ar, phi_ar, sigma_ar, rng)
+        proj_b = project_apc_calendar(fit_b, calendar_index, fator_sim)
+
+        total = 0.0
+        for i in 1:n_cohorts
+            k_vec[i] == 0 && continue
+            for j in (k_vec[i] + 1):tcol[i]
+                mu = proj_b[i, j]
+                (isnan(mu) || mu <= 0) && continue
+                shp = max(mu / phi_b, 1e-8)
+                total += rand(rng, Gamma(shp, phi_b))
+            end
+        end
+        reservas[b] = total
+    end
+    return reservas, pontual
 end
 
 end # module
