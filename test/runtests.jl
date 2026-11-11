@@ -8,6 +8,7 @@ using .ChainLadderCredito.ChainLadderCore
 using .ChainLadderCredito.VintageSim
 using .ChainLadderCredito.Backtest
 using .ChainLadderCredito.ApcModel
+using .ChainLadderCredito.FatorComum
 
 @testset "ChainLadderCore" begin
 
@@ -531,6 +532,107 @@ using .ChainLadderCredito.ApcModel
         @test mean(reservas) > 0
         @test std(reservas) / mean(reservas) < 1e-4  # colapso: só ruído de ponto flutuante
         @test pontual ≈ mean(reservas) rtol=1e-4
+    end
+
+    @testset "FatorComum: estimar_beta_r2 recupera beta e R²=beta² em casos exatos" begin
+        rng = MersenneTwister(99)
+        f = randn(rng, 200)
+        @test estimar_beta_r2(f, f) == (1.0, 1.0)              # y = f exatamente
+        @test estimar_beta_r2(-f, f) == (-1.0, 1.0)            # y = -f: beta=-1, R²=1 (sinal não afeta R²)
+        beta_hat, r2_hat = estimar_beta_r2(2.0 .* f .+ 5.0, f)  # transformação afim não muda beta/R² (ambos padronizados)
+        @test beta_hat ≈ 1.0 atol=1e-9
+        @test r2_hat ≈ 1.0 atol=1e-9
+        @test beta_hat^2 ≈ r2_hat atol=1e-12                    # R² = beta² é identidade algébrica, não aproximação
+    end
+
+    @testset "FatorComum: fator_pca_loo recupera beta_s em série sintética com fator comum conhecido" begin
+        # Seis séries com o MESMO fator comum f e betas conhecidos nos dois extremos e
+        # no meio -- paralelo direto do teste de beta_s multi-segmento já existente em
+        # ApcModel/VintageSim, agora para o fator construído aqui (PCA leave-one-out)
+        # em vez do beta_s usado para SIMULAR o triângulo.
+        rng = MersenneTwister(2026)
+        T = 300
+        betas_true = [0.0, 0.3, 0.6, 0.9, 0.6, 0.3]
+        f_true = randn(rng, T)
+        Y = hcat([betas_true[i] .* f_true .+ sqrt(1 - betas_true[i]^2) .* randn(rng, T)
+                  for i in eachindex(betas_true)]...)
+        Z = hcat([padronizar_serie(Y[:, i]) for i in axes(Y, 2)]...)
+
+        beta_hat = Float64[]
+        for i in eachindex(betas_true)
+            f_loo = fator_pca_loo(Z, i)
+            bh, r2h = estimar_beta_r2(Z[:, i], f_loo)
+            push!(beta_hat, bh)
+            @test r2h ≈ bh^2 atol=1e-12
+        end
+        @test abs(beta_hat[1]) < 0.25           # beta_true = 0,0
+        # beta_hat[4] (beta_true=0,9) fica ATENUADO em relação ao verdadeiro: o fator
+        # leave-one-out é a PCA de só 5 colunas (as outras), não o f_true exato, então
+        # correlaciona com f_true de forma imperfeita (corr < 1) -- um viés de
+        # atenuação esperado e estrutural (quanto menos colunas restantes e mais fraco
+        # o beta delas, maior a atenuação), não um bug de implementação.
+        @test beta_hat[4] > 0.55
+        @test issorted(abs.(beta_hat[[1, 2, 3]]))  # ordem preservada entre 0, 0.3, 0.6
+    end
+
+    @testset "FatorComum: fator_pca_loo / fator_media_simples_loo / fator_media_ponderada_loo nunca leem a coluna i (sem vazamento)" begin
+        # Garantia de ausência de vazamento, mesmo padrão já usado para fit_ar1_fator:
+        # substituir a coluna i por lixo (valores arbitrários, inclusive NaN-livres mas
+        # absurdos) não pode mudar o fator leave-one-out calculado para aquele i, porque
+        # a função nunca deveria olhar para essa coluna.
+        rng = MersenneTwister(7)
+        T, N = 120, 5
+        Z1 = hcat([padronizar_serie(randn(rng, T)) for _ in 1:N]...)
+        Z2 = copy(Z1)
+        Z2[:, 2] = padronizar_serie(1000.0 .* randn(rng, T) .+ 1e6)  # lixo arbitrário na coluna 2
+        pesos = [1.0, 999.0, 2.0, 3.0, 4.0]  # peso da coluna 2 também irrelevante para o fator de i=2
+
+        @test fator_pca_loo(Z1, 2) ≈ fator_pca_loo(Z2, 2)
+        @test fator_media_simples_loo(Z1, 2) ≈ fator_media_simples_loo(Z2, 2)
+        @test fator_media_ponderada_loo(Z1, pesos, 2) ≈ fator_media_ponderada_loo(Z2, pesos, 2)
+
+        # e, inversamente, mudar qualquer OUTRA coluna muda o fator de i=2 (checagem de
+        # que o teste acima não passa trivialmente porque a função ignora tudo)
+        Z3 = copy(Z1)
+        Z3[:, 3] = padronizar_serie(randn(rng, T))
+        @test !isapprox(fator_pca_loo(Z1, 2), fator_pca_loo(Z3, 2))
+    end
+
+    @testset "FatorComum: bootstrap_beta_r2 cobre o beta verdadeiro com frequência razoável" begin
+        # Checagem de cobertura leve (não um Monte Carlo de 200 sementes como o do
+        # modelo APC): 40 réplicas independentes de uma série curta (T=50, comparável à
+        # amostra real de 53 variações trimestrais), beta verdadeiro fixo, IC90% via
+        # bootstrap em blocos -- a cobertura empírica não deveria ficar muito abaixo do
+        # nominal, nem o IC deveria colapsar para largura zero.
+        rng = MersenneTwister(555)
+        T = 50
+        beta_true = 0.5
+        n_rep = 40
+        acertos = 0
+        larguras = Float64[]
+        for _ in 1:n_rep
+            f = randn(rng, T)
+            y = beta_true .* f .+ sqrt(1 - beta_true^2) .* randn(rng, T)
+            betas_b, r2s_b = bootstrap_beta_r2(y, f; n_boot=1000, bloco=8, seed=rand(rng, 1:10^6))
+            lo, hi = intervalo_percentil(betas_b; alpha=0.10)
+            push!(larguras, hi - lo)
+            (lo <= beta_true <= hi) && (acertos += 1)
+        end
+        @test acertos / n_rep > 0.5   # bem abaixo do nominal 0,90, só para travar regressão grosseira
+        @test minimum(larguras) > 0.01
+    end
+
+    @testset "FatorComum: variacao_log e padronizar_serie" begin
+        taxa = [0.05, 0.055, 0.05, 0.06]
+        v = variacao_log(taxa)
+        @test length(v) == 3
+        @test v[1] ≈ log(0.055 / 0.05) atol=1e-12
+        @test v[3] ≈ log(0.06 / 0.05) atol=1e-12
+
+        x = [1.0, 2.0, 3.0, 4.0, 5.0]
+        xs = padronizar_serie(x)
+        @test mean(xs) ≈ 0.0 atol=1e-12
+        @test std(xs) ≈ 1.0 atol=1e-12
     end
 
 end
