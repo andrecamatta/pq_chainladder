@@ -2,7 +2,7 @@
 
 julia_version = "1.13.3"
 manifest_format = "2.1"
-project_hash = "a53c7fa4ab636b7af4b12503f98e4267cf8c0809"
+project_hash = "8ad1625c5793970edf6c3ee763fed5db40c86022"
 
 [[deps.Accessors]]
 deps = ["CompositionsBase", "ConstructionBase", "Dates", "InverseFunctions", "MacroTools"]
@@ -52,7 +52,7 @@ uuid = "336ed68f-0bac-5ca0-87d4-7b16caf5d00b"
 version = "0.10.17"
 
 [[deps.ChainLadderCredito]]
-deps = ["CSV", "DataFrames", "Dates", "Distributions", "JSON3", "Random", "Statistics", "StatsBase", "Test"]
+deps = ["CSV", "DataFrames", "Dates", "Distributions", "JSON3", "LinearAlgebra", "Random", "Statistics", "StatsBase", "Test"]
 path = "."
 uuid = "7c1b1f9a-8a2e-4e5a-9c1a-2f6b9a8e4d31"
 version = "0.1.0"
