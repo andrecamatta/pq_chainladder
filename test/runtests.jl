@@ -635,6 +635,82 @@ using .ChainLadderCredito.FatorComum
         @test std(xs) ≈ 1.0 atol=1e-12
     end
 
+    @testset "FatorComum: fator_pca / fator_media_ponderada (globais, sem exclusão) recuperam fator comum conhecido" begin
+        # Mesmo desenho sintético do teste leave-one-out acima, mas aqui o fator usa
+        # TODAS as colunas -- não há coluna i a excluir porque o uso pretendido é
+        # correlacionar o fator comum com uma série macro EXTERNA, onde não há
+        # circularidade (a série macro nunca entra em Z).
+        rng = MersenneTwister(4242)
+        T = 300
+        betas_true = [0.0, 0.3, 0.6, 0.9, 0.6, 0.3]
+        f_true = randn(rng, T)
+        Y = hcat([betas_true[i] .* f_true .+ sqrt(1 - betas_true[i]^2) .* randn(rng, T)
+                  for i in eachindex(betas_true)]...)
+        Z = hcat([padronizar_serie(Y[:, i]) for i in axes(Y, 2)]...)
+
+        f_global = fator_pca(Z)
+        @test length(f_global) == T
+        @test abs(mean(f_global)) < 1e-9
+        @test std(f_global) ≈ 1.0 atol=1e-9
+        # usando TODAS as colunas (incluindo as de beta alto), a correlação com o
+        # fator verdadeiro deve ser mais forte que qualquer versão leave-one-out
+        # (que usa só 5 das 6 colunas) -- checagem direta de que incluir mais sinal
+        # ajuda, não um valor-alvo arbitrário.
+        corr_global = cor(f_global, f_true)
+        # excluir a coluna de MAIOR beta (0,9, índice 4) é o pior caso para o leave-
+        # one-out: tira do fator exatamente a série que mais carrega o sinal comum.
+        corr_loo_pior_caso = cor(fator_pca_loo(Z, 4), f_true)
+        @test abs(corr_global) > abs(corr_loo_pior_caso)
+
+        pesos = fill(1.0, 6)
+        f_pond = fator_media_ponderada(Z, pesos)
+        @test abs(mean(f_pond)) < 1e-9
+        @test std(f_pond) ≈ 1.0 atol=1e-9
+        @test cor(f_pond, f_global) > 0.8  # concordam fortemente nesse desenho balanceado
+    end
+
+    @testset "FatorComum: correlacao_defasada recupera o lag verdadeiro de uma série atrasada" begin
+        rng = MersenneTwister(314)
+        n = 120
+        x = randn(rng, n)
+        # y é x atrasada 2 períodos: y[t] = x[t-2] para t > 2 -- ou seja, y SEGUE x
+        # (x lidera, y reage com atraso de 2).
+        y = fill(0.0, n)
+        y[3:n] = x[1:(n - 2)]
+        y[1:2] = randn(rng, 2)
+
+        # correlacao_defasada(x, y, lag) pareia x[t] com y[t-lag]: como quem está
+        # ATRASADA é y (e não x), o lag que recupera a relação exata é NEGATIVO do
+        # ponto de vista de x (equivalente a correlacao_defasada(y, x, +2) == 1).
+        corrs = Dict(lag => correlacao_defasada(x, y, lag) for lag in -4:4)
+        melhor_lag = argmax(lag -> corrs[lag], -4:4)
+        @test melhor_lag == -2
+        @test corrs[-2] > 0.95
+        @test correlacao_defasada(y, x, 2) ≈ corrs[-2] atol=1e-12  # simetria: trocar a ordem inverte o sinal do lag
+    end
+
+    @testset "FatorComum: beta_r2_janela_movel detecta mudança de regime (beta baixo -> alto)" begin
+        rng = MersenneTwister(271828)
+        n = 80
+        corte = 40
+        f = randn(rng, n)
+        y = fill(0.0, n)
+        y[1:corte] = 0.05 .* f[1:corte] .+ sqrt(1 - 0.05^2) .* randn(rng, corte)        # quase sem beta
+        y[(corte + 1):n] = 0.85 .* f[(corte + 1):n] .+ sqrt(1 - 0.85^2) .* randn(rng, n - corte)  # beta alto
+
+        janela = 20
+        fim_idx, betas, r2s = beta_r2_janela_movel(y, f, janela)
+        @test all(r2s .≈ betas .^ 2)
+        @test length(fim_idx) == n - janela + 1
+
+        # janela toda dentro do regime de beta baixo (termina bem antes do corte)
+        beta_regime_baixo = betas[findfirst(==(corte - 5), fim_idx)]
+        # janela toda dentro do regime de beta alto (começa bem depois do corte)
+        beta_regime_alto = betas[findlast(==(n), fim_idx)]
+        @test abs(beta_regime_baixo) < abs(beta_regime_alto)
+        @test beta_regime_alto > 0.6
+    end
+
 end
 
 println("Todos os testes passaram.")

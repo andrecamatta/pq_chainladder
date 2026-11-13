@@ -7,7 +7,8 @@ using Dates
 
 export variacao_log, padronizar_serie, fator_pca_loo, fator_media_simples_loo,
        fator_media_ponderada_loo, estimar_beta_r2, bootstrap_beta_r2, intervalo_percentil,
-       indices_subperiodo
+       indices_subperiodo, fator_pca, fator_media_ponderada, correlacao_defasada,
+       beta_r2_janela_movel
 
 """
     variacao_log(taxa)
@@ -192,6 +193,96 @@ após `variacao_log`, um elemento mais curto que a série de nível original).
 """
 function indices_subperiodo(datas::Vector{Date}, corte::Date)
     return findall(d -> d < corte, datas), findall(d -> d >= corte, datas)
+end
+
+"""
+    fator_pca(Z)
+
+Primeiro componente principal (PC1) de TODAS as colunas de `Z` (T×N, cada coluna já
+padronizada) -- diferente de `fator_pca_loo`, que exclui uma coluna por vez. Usado
+quando o fator comum em si (não o β de uma modalidade específica contra ele) é o
+objeto de interesse -- por exemplo, para correlacionar a SÉRIE do fator com variáveis
+macroeconômicas externas, onde não há nenhuma circularidade a evitar (nenhuma das
+colunas de `Z` é a série macro). Mesma convenção de sinal de `fator_pca_loo` (positivo
+com a média simples das colunas).
+"""
+function fator_pca(Z::AbstractMatrix{Float64})
+    size(Z, 2) >= 2 || error("fator_pca exige pelo menos 2 colunas")
+    C = cor(Z)
+    autovals, autovecs = eigen(Symmetric(C))
+    k = argmax(autovals)
+    v = autovecs[:, k]
+    f = Z * v
+    f = f .- mean(f)
+    f = f ./ std(f)
+    media_simples = vec(mean(Z, dims=2))
+    cor(f, media_simples) < 0 && (f = -f)
+    return f
+end
+
+"""
+    fator_media_ponderada(Z, pesos)
+
+Média ponderada de TODAS as colunas de `Z`, análogo de `fator_media_ponderada_loo`
+sem exclusão -- mesma lógica de `fator_pca` acima (fator comum como objeto de
+interesse, não β leave-one-out de uma modalidade específica).
+"""
+function fator_media_ponderada(Z::AbstractMatrix{Float64}, pesos::Vector{Float64})
+    length(pesos) == size(Z, 2) || error("pesos precisa ter um valor por coluna de Z")
+    w = pesos ./ sum(pesos)
+    return padronizar_serie(vec(Z * w))
+end
+
+"""
+    correlacao_defasada(x, y, lag)
+
+Correlação de Pearson entre `x[t]` e `y[t-lag]` (lag positivo: `y` DEFASADA, ou seja,
+`y` no passado em relação a `x` -- testa se `x` segue `y` com atraso de `lag`
+períodos). Lag negativo testa o sentido contrário (`x` atrasada em relação a `y`).
+Usa a interseção de índices válidos; `length(x) == length(y)` é exigido (mesma
+contagem de períodos nas duas séries, alinhadas tempo a tempo antes de chamar).
+"""
+function correlacao_defasada(x::Vector{Float64}, y::Vector{Float64}, lag::Int)
+    length(x) == length(y) || error("x e y precisam ter o mesmo comprimento")
+    n = length(x)
+    if lag >= 0
+        xi = x[(1 + lag):n]
+        yi = y[1:(n - lag)]
+    else
+        xi = x[1:(n + lag)]
+        yi = y[(1 - lag):n]
+    end
+    length(xi) >= 3 || error("poucos pontos restantes para este lag")
+    return cor(xi, yi)
+end
+
+"""
+    beta_r2_janela_movel(y, f, janela)
+
+β e R² (`estimar_beta_r2`) recalculados numa janela móvel de `janela` observações
+sobre `y` e `f` (mesmo comprimento) -- o fator `f` é passado FIXO (calculado uma vez
+na amostra completa, não reestimado por janela), então isto mede se a RELAÇÃO entre
+`y` e um fator comum já conhecido varia no tempo, não se o próprio fator mudaria se
+reestimado numa janela curta (seria ruidoso demais com janelas de 12-16 trimestres e
+~6 colunas). Devolve `(datas_fim_idx, betas, r2s)`: `datas_fim_idx[k]` é o índice,
+dentro de `y`/`f`, do ÚLTIMO ponto da k-ésima janela (use para indexar o vetor de
+datas correspondente).
+"""
+function beta_r2_janela_movel(y::Vector{Float64}, f::Vector{Float64}, janela::Int)
+    length(y) == length(f) || error("y e f precisam ter o mesmo comprimento")
+    n = length(y)
+    n >= janela || error("série mais curta que a janela")
+    fim_idx = Int[]
+    betas = Float64[]
+    r2s = Float64[]
+    for fim in janela:n
+        inicio = fim - janela + 1
+        b, r2 = estimar_beta_r2(y[inicio:fim], f[inicio:fim])
+        push!(fim_idx, fim)
+        push!(betas, b)
+        push!(r2s, r2)
+    end
+    return fim_idx, betas, r2s
 end
 
 end # module

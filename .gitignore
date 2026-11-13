@@ -2,3 +2,4 @@
 .DS_Store
 RESULTADOS.md
 *.py
+data/sgs_raw/

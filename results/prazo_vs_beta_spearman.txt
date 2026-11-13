@@ -1,0 +1,3 @@
+spearman_prazo_scr_pos_vs_beta_pos,-0.6785714285714286
+spearman_prazo_sgs_pos_vs_beta_pos,-0.4642857142857143
+spearman_prazo_scr_pre_vs_beta_pre,0.39285714285714285
